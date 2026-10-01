@@ -1202,6 +1202,16 @@ uint32_t llama_kv_cache::get_size() const {
     return cells.size();
 }
 
+uint32_t llama_kv_cache::get_n_seq_max() const {
+    return n_seq_max;
+}
+
+uint32_t llama_kv_cache::get_stream(llama_seq_id seq_id) const {
+    GGML_ASSERT(seq_id >= 0 && (size_t) seq_id < seq_to_stream.size());
+
+    return seq_to_stream[seq_id];
+}
+
 uint32_t llama_kv_cache::get_n_stream() const {
     return n_stream;
 }

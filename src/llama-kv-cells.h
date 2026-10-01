@@ -310,6 +310,14 @@ public:
         return seq[i];
     }
 
+    // the (pos, cell) pairs of sequence seq_id, ordered by position (from upstream 649dcb1)
+    const std::set<std::pair<llama_pos, uint32_t>> & seq_pos_get(llama_seq_id seq_id) const {
+        assert(seq_id >= 0);
+        assert(seq_id < LLAMA_MAX_SEQ);
+
+        return seq_pos[seq_id];
+    }
+
     // check if the cell contains seq_id
     bool seq_has(uint32_t i, llama_seq_id seq_id) const {
         assert(i < pos.size());
