@@ -231,7 +231,13 @@ struct llama_layer_nextn {
     struct ggml_tensor * shared_head_head      = nullptr;
     struct ggml_tensor * shared_head_head_s    = nullptr;
     struct ggml_tensor * shared_head_head_in_s = nullptr;
+    struct ggml_tensor * head_sub              = nullptr; // reduced-vocabulary draft head (rows of the LM head)
+    struct ggml_tensor * head_ids              = nullptr; // I32 token id of each head_sub row
     struct ggml_tensor * shared_head_norm      = nullptr;
+
+    struct ggml_tensor * hc_head_norm          = nullptr;
+    struct ggml_tensor * hc_head_down          = nullptr;
+    struct ggml_tensor * hc_head_up            = nullptr;
 };
 
 struct llama_layer_switch_lora {
@@ -575,6 +581,11 @@ struct llama_layer {
     struct ggml_tensor * hc_ffn_down    = nullptr;
     struct ggml_tensor * hc_ffn_up      = nullptr;
     struct ggml_tensor * hc_ffn_inject  = nullptr;
+    // qwen4exp, optional same-input merges: fewer small matmuls
+    struct ggml_tensor * hc_attn_down_inject = nullptr;
+    struct ggml_tensor * hc_ffn_down_inject  = nullptr;
+    struct ggml_tensor * ssm_zba             = nullptr;
+    struct ggml_tensor * ffn_gate_up_shexp   = nullptr;
 
     struct ggml_tensor * ple_key        = nullptr;
     struct ggml_tensor * ple_value      = nullptr;

@@ -611,6 +611,10 @@ enum llm_tensor {
     LLM_TENSOR_HC_FFN_DOWN,    // qwen4exp
     LLM_TENSOR_HC_FFN_UP,      // qwen4exp
     LLM_TENSOR_HC_FFN_INJECT,  // qwen4exp
+    LLM_TENSOR_HC_ATTN_DOWN_INJECT, // qwen4exp: hc_attn_down and hc_attn_inject rows in one matrix
+    LLM_TENSOR_HC_FFN_DOWN_INJECT,  // qwen4exp: hc_ffn_down and hc_ffn_inject rows in one matrix
+    LLM_TENSOR_SSM_ZBA,             // qwen4exp: attn_gate (z), ssm_beta, ssm_alpha rows in one matrix
+    LLM_TENSOR_FFN_GATE_UP_SHEXP,   // qwen4exp: shared expert gate and up rows in one matrix
     LLM_TENSOR_PLE_KEY,        // qwen4exp
     LLM_TENSOR_PLE_VALUE,      // qwen4exp
     LLM_TENSOR_PLE_NORM_KEY,   // qwen4exp
@@ -697,7 +701,12 @@ enum llm_tensor {
     LLM_TENSOR_NEXTN_ENORM,
     LLM_TENSOR_NEXTN_HNORM,
     LLM_TENSOR_NEXTN_SHARED_HEAD_HEAD,
+    LLM_TENSOR_NEXTN_HEAD_SUB,
+    LLM_TENSOR_NEXTN_HEAD_IDS,
     LLM_TENSOR_NEXTN_SHARED_HEAD_NORM,
+    LLM_TENSOR_NEXTN_HC_HEAD_NORM,
+    LLM_TENSOR_NEXTN_HC_HEAD_DOWN,
+    LLM_TENSOR_NEXTN_HC_HEAD_UP,
     LLM_TENSOR_MASKED_EMBD_CENTROIDS,
     LLM_TENSOR_MASKED_EMBD_ORDERING,
     LLM_TENSOR_HRM_Z_L_INIT,

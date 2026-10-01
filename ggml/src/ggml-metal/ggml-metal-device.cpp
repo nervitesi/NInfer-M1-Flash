@@ -1179,7 +1179,7 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mm_id(ggml_m
     return res;
 }
 
-ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv_id(ggml_metal_library_t lib, const ggml_tensor * op) {
+ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv_id(ggml_metal_library_t lib, const ggml_tensor * op, bool m1_tuning) {
     GGML_TENSOR_LOCALS( int32_t, ne0, op->src[0], ne);
     GGML_TENSOR_LOCALS( int32_t, ne1, op->src[1], ne);
 
@@ -1365,12 +1365,22 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv_id(ggml_m
                 nsg = N_SG_IQ4_NL;
                 nr0 = N_R0_IQ4_NL;
                 smem = 32*sizeof(float);
+                // M1: 13-16% faster on the 640-wide rows of the MoE down projection
+                if (m1_tuning) {
+                    nr0 = N_R0_IQ4_ID_M1;
+                    suffix = "_m1";
+                }
             } break;
         case GGML_TYPE_IQ4_XS:
             {
                 nsg = N_SG_IQ4_XS;
                 nr0 = N_R0_IQ4_XS;
                 smem = 32*sizeof(float);
+                // M1: 6% faster with 2+ tokens (MTP verify), 4% slower with 1
+                if (m1_tuning && op->src[2]->ne[1] > 1) {
+                    nr0 = N_R0_IQ4_ID_M1;
+                    suffix = "_m1";
+                }
             } break;
         case GGML_TYPE_TQ2_0:
             {

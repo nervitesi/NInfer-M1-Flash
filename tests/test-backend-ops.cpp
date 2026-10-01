@@ -10063,6 +10063,30 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_mul_mat_id_w4a8(GGML_TYPE_MXFP4, GGML_TYPE_F32, 8, 2, false, 32, 32, 256));
     test_cases.emplace_back(new test_mul_mat_id_w4a4(GGML_TYPE_MXFP4, GGML_TYPE_F32, 8, 2, false, 32, 32, 256));
 
+    // qwen4exp dense projections at MTP verify widths (M1 small-batch kernel choices)
+    for (int n = 1; n <= 8; ++n) {
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_IQ4_XS, GGML_TYPE_F32, 6240, n, 2560, {1, 1}, {1, 1}));
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_IQ4_XS, GGML_TYPE_F32, 2560, n, 6144, {1, 1}, {1, 1}));
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_IQ4_NL, GGML_TYPE_F32, 1024, n,  320, {1, 1}, {1, 1})); // hyper-connection up
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_IQ4_NL, GGML_TYPE_F32, 2560, n,  640, {1, 1}, {1, 1})); // shared expert down
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q5_K,   GGML_TYPE_F32, 1024, n, 2560, {1, 1}, {1, 1}));
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q6_K,   GGML_TYPE_F32, 1024, n, 2560, {1, 1}, {1, 1}));
+    }
+
+    // MUL_MAT_ID for small batches (MTP verify): shared experts across 2..8 tokens
+    for (ggml_type type_a : {GGML_TYPE_IQ4_XS, GGML_TYPE_IQ4_NL}) {
+        for (int n = 2; n <= 9; ++n) {
+            for (bool b : {false, true}) {
+                test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32,  8,  4, b,   64, n,  256));
+                test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32,  4,  4, b,   64, n,  512));
+            }
+        }
+    }
+    for (int n = 2; n <= 8; n += 2) {
+        test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_IQ4_XS, GGML_TYPE_F32, 32, 10, true,   640, n, 2560)); // qwen4exp gate/up
+        test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_IQ4_NL, GGML_TYPE_F32, 32, 10, false, 2560, n,  640)); // qwen4exp down
+    }
+
 #if 0
     // > 4GB A matrix. Too slow to be enabled by default.
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F16, GGML_TYPE_F16,  900000,  3, 2592, {1, 1}, {1, 1}));
@@ -11259,6 +11283,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
 // Test cases for performance evaluation: should be representative of real-world use cases
 static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     std::vector<std::unique_ptr<test_case>> test_cases;
+    // qwen4exp MoE at MTP verify widths: random routing, and all tokens on the same experts
+    for (int n : {1, 2, 4, 8}) {
+        test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_IQ4_XS, GGML_TYPE_F32, 288, 10, true,   640, n, 2560));
+        test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_IQ4_NL, GGML_TYPE_F32, 288, 10, false, 2560, n,  640));
+        test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_IQ4_XS, GGML_TYPE_F32,  10, 10, true,   640, n, 2560));
+    }
 
     // SWIGLU at a 27B-class FFN width, fused [gate|up] vs split operands
     // note: same bytes either way, so a backend that indexes them differently shows it here

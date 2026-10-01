@@ -11,6 +11,7 @@
 #include "ggml-metal-tuning.h"
 
 #include <cassert>
+#include <cstdlib>
 #include <algorithm>
 #include <limits>
 #include <cmath>
@@ -2420,6 +2421,18 @@ int ggml_metal_op_pool_2d(ggml_metal_op_t ctx, int idx) {
     return 1;
 }
 
+// Kernel choices measured on an M1 Max (GPU family Apple7) with Qwen3.8 Flash Next at MTP verify
+// widths (2-8 tokens); other families keep the upstream choices. GGML_METAL_M1_TUNING=0/1 forces
+// them off/on. Results per row are unchanged except where a matrix switches to the small-batch
+// (ext) kernel, whose summation order differs from the per-token kernel.
+static bool ggml_metal_m1_tuning(const ggml_metal_device_props * props) {
+    static const int env = [] {
+        const char * s = getenv("GGML_METAL_M1_TUNING");
+        return s ? atoi(s) : -1;
+    }();
+    return env >= 0 ? env != 0 : props->gpu_family == 7;
+}
+
 int ggml_metal_op_mul_mat(ggml_metal_op_t ctx, int idx) {
     ggml_tensor * op = ctx->node(idx);
 
@@ -2447,9 +2460,15 @@ int ggml_metal_op_mul_mat(ggml_metal_op_t ctx, int idx) {
     const int16_t r2 = ne12/ne02;
     const int16_t r3 = ne13/ne03;
 
+    const bool m1 = ggml_metal_m1_tuning(props_dev);
+
+    // M1: IQ4_NL rows of 64*k values (the 320-wide hyper-connection up projections) with 4
+    // threads per row: 45-55% faster than the per-token kernel with 2-8 tokens
+    const bool ext_k64 = m1 && op->src[0]->type == GGML_TYPE_IQ4_NL && ne00%64 == 0;
+
     // first try to use small-batch mat-mv kernels
     // these should be efficient for BS [2, ~8]
-    if (op->src[1]->type == GGML_TYPE_F32 && (ne00%128 == 0) &&
+    if (op->src[1]->type == GGML_TYPE_F32 && (ne00%128 == 0 || ext_k64) &&
         (
          (
           (
@@ -2468,13 +2487,21 @@ int ggml_metal_op_mul_mat(ggml_metal_op_t ctx, int idx) {
            false) && (ne11 >= 2 && ne11 <= 8)
          ) ||
          (
+          // M1: upstream re-decodes IQ4_XS weights for every token; the small-batch kernel is
+          // 11-40% faster with 3-8 tokens on tall matrices (6240-12288 rows) and on 2560 rows
+          // of 6144 values; 3x slower on 324 rows of 10240 values, slower with 2 tokens
+          m1 && op->src[0]->type == GGML_TYPE_IQ4_XS && (ne01 >= 4096 || (ne00 >= 4096 && ne01 >= 2048)) && (ne11 >= 3 && ne11 <= 8)
+         ) ||
+         (
           (
            op->src[0]->type == GGML_TYPE_Q4_K ||
            op->src[0]->type == GGML_TYPE_Q5_K ||
            op->src[0]->type == GGML_TYPE_Q6_K ||
            op->src[0]->type == GGML_TYPE_Q2_K ||
            op->src[0]->type == GGML_TYPE_Q3_K ||
-           false) && (ne11 >= 4 && ne11 <= 8)
+           // M1: already 30-39% faster with 3 tokens on tall matrices (Q5_K 2560x10240, Q6_K
+           // LM head) and, for Q5_K, 7-11% faster with 2
+           false) && (ne11 >= (m1 ? (op->src[0]->type == GGML_TYPE_Q5_K ? 2 : 3) : 4) && ne11 <= 8)
          )
         )
        ) {
@@ -2486,7 +2513,7 @@ int ggml_metal_op_mul_mat(ggml_metal_op_t ctx, int idx) {
         //       my current hypothesis is that the work grid is not evenly divisible for different nsg
         //       values and there can be some tail effects when nsg is high. need to confirm this
         //
-        const int nsg    = 2;                 // num simdgroups per threadgroup
+        int nsg = 2;                          // num simdgroups per threadgroup
 
         // num threads along row per simdgroup
         int16_t nxpsg = 0;
@@ -2496,6 +2523,15 @@ int ggml_metal_op_mul_mat(ggml_metal_op_t ctx, int idx) {
             nxpsg = 8;
         } else {
             nxpsg = 4;
+        }
+
+        // M1 (measured per shape at 2-8 tokens)
+        if (m1 && op->src[0]->type == GGML_TYPE_IQ4_XS) {
+            nsg   = ne00 >= 4096 ? 4 : 2;
+            nxpsg = ne11 >= 8 ? 4 : 8;
+        }
+        if (m1 && op->src[0]->type == GGML_TYPE_IQ4_NL) {
+            nsg = (ne11 >= 4 || ext_k64) ? 4 : 2;
         }
 
         const int16_t nypsg  = 32/nxpsg;          // num threads along col per simdgroup (i.e. a simdgroup processes that many src0 rows at a time)
@@ -2840,7 +2876,7 @@ int ggml_metal_op_mul_mat_id(ggml_metal_op_t ctx, int idx) {
             ggml_metal_encoder_dispatch_threadgroups(enc, (ne21 + 31)/32, (ne01 + 63)/64, ne02, 128, 1, 1);
         }
     } else {
-        auto pipeline = ggml_metal_library_get_pipeline_mul_mv_id(lib, op);
+        auto pipeline = ggml_metal_library_get_pipeline_mul_mv_id(lib, op, ggml_metal_m1_tuning(props_dev));
 
         const int nr0 = pipeline.nr0;
         const int nr1 = pipeline.nr1;
