@@ -97,6 +97,9 @@ struct server_context {
     // terminate main loop (will unblock start_loop)
     void terminate();
 
+    // NInfer-M1: write the prompt cache to --prompt-cache-dir; call after start_loop() returns
+    void persist_prompt_cache();
+
     // get the underlaying llama_context, can return nullptr if sleeping
     // not thread-safe, should only be used from the main thread
     llama_context * get_llama_context() const;

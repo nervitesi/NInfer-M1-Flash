@@ -541,6 +541,9 @@ int llama_server(common_params & params, int argc, char ** argv) {
         // this call blocks the main thread until queue_tasks.terminate() is called
         ctx_server.start_loop();
 
+        // NInfer-M1: the loop has stopped, the contexts are still alive
+        ctx_server.persist_prompt_cache();
+
         clean_up();
         ctx_http.join();
         if (monitor_thread.joinable()) {

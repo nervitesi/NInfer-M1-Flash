@@ -1,3 +1,4 @@
+#include <cstring>
 #include "server-context.h"
 #include "server-chat.h"
 #include "server-common.h"
@@ -935,6 +936,168 @@ private:
 
     int64_t t_last_load_progress_ms = 0;
 
+    //
+    // NInfer-M1: prompt cache on disk (--prompt-cache-dir)
+    // one file per cache entry: magic, fingerprint of the loaded models, tokens, context checkpoints,
+    // target and draft states. Entries from other models or settings are ignored.
+    //
+
+    static constexpr char prompt_cache_magic[8] = {'N', 'I', 'P', 'C', 'A', 'C', 'H', '1'};
+
+    std::string prompt_cache_fingerprint() const {
+        std::string s;
+        char buf[512];
+        for (const llama_model * m : {(const llama_model *) model_tgt, (const llama_model *) model_dft}) {
+            if (m == nullptr) {
+                s += "none|";
+                continue;
+            }
+            llama_model_desc(m, buf, sizeof(buf));
+            s += std::string(buf) + "|" + std::to_string(llama_model_size(m)) + "|" + std::to_string(llama_model_n_params(m)) + "|";
+        }
+        // settings that change the cached layout
+        const char * ratio = getenv("LLAMA_QWEN4EXP_COMPRESS_RATIO");
+        s += std::string("qsa=") + (ratio ? ratio : "-");
+        return s;
+    }
+
+    void persist_prompt_cache() {
+        namespace fs = std::filesystem;
+        if (params_base.prompt_cache_dir.empty() || !prompt_cache) {
+            return;
+        }
+        const int64_t t_start = ggml_time_us();
+
+        for (auto & slot : slots) {
+            if (slot.prompt_save(*prompt_cache)) {
+                prompt_cache->update();
+            }
+        }
+
+        const fs::path dir(params_base.prompt_cache_dir);
+        std::error_code ec;
+        fs::create_directories(dir, ec);
+        for (const auto & f : fs::directory_iterator(dir, ec)) {
+            if (f.path().extension() == ".nipc") {
+                fs::remove(f.path(), ec);
+            }
+        }
+
+        const std::string fp = prompt_cache_fingerprint();
+        size_t n_files = 0, n_bytes = 0;
+        int idx = 0;
+        for (const auto & st : prompt_cache->states) {
+            llama_tokens tokens;
+            try {
+                tokens = st.prompt.tokens.get_tokens();
+            } catch (...) {
+                continue; // multimodal prompts are not persisted
+            }
+            const fs::path tmp = dir / ("entry-" + std::to_string(idx) + ".nipc.partial");
+            const fs::path dst = dir / ("entry-" + std::to_string(idx) + ".nipc");
+            idx++;
+            std::ofstream out(tmp, std::ios::binary);
+            auto put_u64 = [&](uint64_t v) { out.write((const char *) &v, sizeof(v)); };
+            auto put_buf = [&](const void * p, size_t n) { put_u64(n); out.write((const char *) p, n); };
+            out.write(prompt_cache_magic, sizeof(prompt_cache_magic));
+            put_buf(fp.data(), fp.size());
+            put_buf(tokens.data(), tokens.size()*sizeof(llama_token));
+            put_u64(st.prompt.checkpoints.size());
+            for (const auto & c : st.prompt.checkpoints) {
+                const int64_t hdr[4] = { c.n_tokens, c.id_task, c.pos_min, c.pos_max };
+                out.write((const char *) hdr, sizeof(hdr));
+                put_buf(c.data_tgt.data(),  c.data_tgt.size());
+                put_buf(c.data_dft.data(),  c.data_dft.size());
+                put_buf(c.data_spec.data(), c.data_spec.size());
+            }
+            put_buf(st.data.main.data(), st.data.main.size());
+            put_buf(st.data.drft.data(), st.data.drft.size());
+            out.close();
+            if (!out) {
+                SRV_WRN("prompt cache: failed to write %s\n", tmp.string().c_str());
+                fs::remove(tmp, ec);
+                continue;
+            }
+            fs::rename(tmp, dst, ec);
+            n_files++;
+            n_bytes += st.size();
+        }
+        SRV_INF("prompt cache: saved %zu entries, %.1f MiB to %s in %.2f s\n", n_files, n_bytes/1024.0/1024.0,
+                dir.string().c_str(), (ggml_time_us() - t_start)/1e6);
+    }
+
+    void restore_prompt_cache() {
+        namespace fs = std::filesystem;
+        const fs::path dir(params_base.prompt_cache_dir);
+        std::error_code ec;
+        if (!fs::is_directory(dir, ec)) {
+            return;
+        }
+        const int64_t t_start = ggml_time_us();
+        std::vector<fs::path> files;
+        for (const auto & f : fs::directory_iterator(dir, ec)) {
+            if (f.path().extension() == ".nipc") {
+                files.push_back(f.path());
+            }
+        }
+        // oldest first, so the cache keeps its LRU order
+        std::sort(files.begin(), files.end(), [](const fs::path & a, const fs::path & b) {
+            std::error_code e;
+            return fs::last_write_time(a, e) < fs::last_write_time(b, e);
+        });
+
+        const std::string fp = prompt_cache_fingerprint();
+        size_t n_ok = 0, n_bytes = 0;
+        for (const auto & path : files) {
+            std::ifstream in(path, std::ios::binary);
+            char magic[8] = {};
+            in.read(magic, sizeof(magic));
+            auto get_u64 = [&]() { uint64_t v = 0; in.read((char *) &v, sizeof(v)); return v; };
+            auto get_buf = [&](std::vector<uint8_t> & v) { v.resize(get_u64()); in.read((char *) v.data(), v.size()); };
+            if (!in || memcmp(magic, prompt_cache_magic, sizeof(magic)) != 0) {
+                continue;
+            }
+            std::vector<uint8_t> buf;
+            get_buf(buf);
+            if (!in || std::string(buf.begin(), buf.end()) != fp) {
+                SRV_WRN("prompt cache: %s was saved with other models or settings, skipping\n", path.filename().string().c_str());
+                continue;
+            }
+            get_buf(buf);
+            llama_tokens tokens(buf.size()/sizeof(llama_token));
+            memcpy(tokens.data(), buf.data(), tokens.size()*sizeof(llama_token));
+
+            server_prompt_cache_state st;
+            st.prompt.tokens = server_tokens(tokens, false);
+            const uint64_t n_ckpt = get_u64();
+            for (uint64_t i = 0; i < n_ckpt && in; ++i) {
+                int64_t hdr[4];
+                in.read((char *) hdr, sizeof(hdr));
+                common_prompt_checkpoint c;
+                c.n_tokens = hdr[0];
+                c.id_task  = (int) hdr[1];
+                c.pos_min  = (llama_pos) hdr[2];
+                c.pos_max  = (llama_pos) hdr[3];
+                get_buf(c.data_tgt);
+                get_buf(c.data_dft);
+                get_buf(c.data_spec);
+                st.prompt.checkpoints.push_back(std::move(c));
+            }
+            get_buf(st.data.main);
+            get_buf(st.data.drft);
+            if (!in) {
+                SRV_WRN("prompt cache: %s is truncated, skipping\n", path.filename().string().c_str());
+                continue;
+            }
+            n_bytes += st.size();
+            prompt_cache->states.push_back(std::move(st));
+            n_ok++;
+        }
+        prompt_cache->update();
+        SRV_INF("prompt cache: restored %zu of %zu entries, %.1f MiB from %s in %.2f s\n", n_ok, files.size(),
+                n_bytes/1024.0/1024.0, dir.string().c_str(), (ggml_time_us() - t_start)/1e6);
+    }
+
     void destroy() {
         spec.reset();
         spec_init.reset();
@@ -1357,6 +1520,10 @@ private:
             SRV_TRC("%s", "use `--cache-ram 0` to disable the prompt cache\n");
 
             prompt_cache = std::make_unique<server_prompt_cache>(params_base.cache_ram_mib, n_ctx);
+
+            if (!params_base.prompt_cache_dir.empty()) {
+                restore_prompt_cache();
+            }
         } else {
             SRV_TRC("%s", "prompt cache is disabled - use `--cache-ram N` to enable it\n");
         }
@@ -4168,6 +4335,10 @@ void server_context::start_loop() {
 
 void server_context::terminate() {
     impl->queue_tasks.terminate();
+}
+
+void server_context::persist_prompt_cache() {
+    impl->persist_prompt_cache();
 }
 
 llama_context * server_context::get_llama_context() const {
