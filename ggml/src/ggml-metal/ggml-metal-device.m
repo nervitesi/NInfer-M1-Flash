@@ -885,7 +885,11 @@ void ggml_metal_encoder_set_threadgroup_memory_size(ggml_metal_encoder_t encoder
     [encoder->obj setThreadgroupMemoryLength:size atIndex:idx];
 }
 
+// NInfer-M1 diagnostic (GGML_METAL_COUNT): number of dispatches encoded
+int64_t g_ggml_metal_n_dispatch = 0;
+
 void ggml_metal_encoder_dispatch_threadgroups(ggml_metal_encoder_t encoder, int tg0, int tg1, int tg2, int tptg0, int tptg1, int tptg2) {
+    __atomic_fetch_add(&g_ggml_metal_n_dispatch, 1, __ATOMIC_RELAXED);
     [encoder->obj dispatchThreadgroups:MTLSizeMake(tg0, tg1, tg2) threadsPerThreadgroup:MTLSizeMake(tptg0, tptg1, tptg2)];
 }
 

@@ -14,6 +14,11 @@
 #include <cstdlib>
 #include <algorithm>
 #include <limits>
+#include <array>
+#include <vector>
+#include <string>
+#include <mutex>
+#include <map>
 #include <cmath>
 
 static ggml_metal_buffer_id ggml_metal_get_buffer_id(const ggml_tensor * t) {
@@ -153,11 +158,41 @@ int ggml_metal_op_n_nodes(ggml_metal_op_t ctx) {
     return ctx->n_nodes();
 }
 
+// NInfer-M1 diagnostic (GGML_METAL_COUNT=1): dispatches and barriers per graph, by op
+extern "C" int64_t g_ggml_metal_n_dispatch;
+static int64_t g_ggml_metal_n_barrier = 0;
+static std::mutex g_count_mutex;
+static std::map<std::string, std::array<int64_t, 3>> g_count_ops; // name -> nodes, dispatches, barriers
+
+static bool ggml_metal_count_enabled() {
+    static const bool on = getenv("GGML_METAL_COUNT") != nullptr;
+    return on;
+}
+
+void ggml_metal_op_count_dump(int n_nodes_graph) {
+    if (!ggml_metal_count_enabled()) {
+        return;
+    }
+    std::lock_guard<std::mutex> lock(g_count_mutex);
+    int64_t nn = 0, nd = 0, nb = 0;
+    std::vector<std::pair<std::string, std::array<int64_t, 3>>> v(g_count_ops.begin(), g_count_ops.end());
+    for (auto & e : v) { nn += e.second[0]; nd += e.second[1]; nb += e.second[2]; }
+    std::sort(v.begin(), v.end(), [](const auto & a, const auto & b) { return a.second[1] > b.second[1]; });
+    std::string top;
+    for (size_t i = 0; i < v.size() && i < 400; ++i) {
+        top += v[i].first + ":" + std::to_string(v[i].second[1]) + "/" + std::to_string(v[i].second[2]) + " ";
+    }
+    GGML_LOG_WARN("METAL_COUNT graph nodes=%d encoded=%lld dispatches=%lld barriers=%lld | op:dispatches/barriers %s\n",
+            n_nodes_graph, (long long) nn, (long long) nd, (long long) nb, top.c_str());
+    g_count_ops.clear();
+}
+
 static bool ggml_metal_op_concurrency_reset(ggml_metal_op_t ctx) {
     if (!ctx->mem_ranges) {
         return true;
     }
 
+    __atomic_fetch_add(&g_ggml_metal_n_barrier, 1, __ATOMIC_RELAXED);
     ggml_metal_encoder_memory_barrier(ctx->enc);
 
     ggml_mem_ranges_reset(ctx->mem_ranges);
@@ -541,7 +576,26 @@ int ggml_metal_op_encode(ggml_metal_op_t ctx, int idx) {
         ggml_metal_encoder_debug_group_push(ctx->enc, ggml_op_desc(ctx->node(idx)));
     }
 
+    const int64_t d0 = __atomic_load_n(&g_ggml_metal_n_dispatch, __ATOMIC_RELAXED);
+    const int64_t b0 = __atomic_load_n(&g_ggml_metal_n_barrier,  __ATOMIC_RELAXED);
     int res = ggml_metal_op_encode_impl(ctx, idx);
+    if (ggml_metal_count_enabled()) {
+        const int64_t d1 = __atomic_load_n(&g_ggml_metal_n_dispatch, __ATOMIC_RELAXED);
+        const int64_t b1 = __atomic_load_n(&g_ggml_metal_n_barrier,  __ATOMIC_RELAXED);
+        if (d1 > d0 || b1 > b0) {
+            const ggml_tensor * node = ctx->node(idx);
+            std::string key = ggml_op_desc(node);
+            const char * nm = ggml_get_name(node);
+            std::string base = nm;
+            const size_t dash = base.find('-');
+            if (dash != std::string::npos) base = base.substr(0, dash);
+            if (base.rfind("node_", 0) == 0 || base.empty() || base[0] == ' ') base = "?";
+            key += "|" + base + (res > 1 ? "+" + std::to_string(res - 1) : "");
+            std::lock_guard<std::mutex> lock(g_count_mutex);
+            auto & c = g_count_ops[key];
+            c[0] += res; c[1] += d1 - d0; c[2] += b1 - b0;
+        }
+    }
     if (idx + res > ctx->n_nodes()) {
         GGML_ABORT("fusion error: nodes spanning multiple encoders have been fused. this indicates a bug in the fusion logic %s",
                 "https://github.com/ggml-org/llama.cpp/pull/14849");

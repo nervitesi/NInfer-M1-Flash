@@ -594,6 +594,8 @@ enum ggml_status ggml_metal_graph_compute(ggml_metal_t ctx, struct ggml_cgraph *
 
         dispatch_apply(n_cb, ctx->d_queue, ctx->encode_async);
 
+        ggml_metal_op_count_dump(gf->n_nodes);
+
         // for debugging: block until graph is computed
         //[ctx->cmd_buf_last waitUntilCompleted];
 
