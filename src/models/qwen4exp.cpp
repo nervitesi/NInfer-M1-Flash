@@ -562,8 +562,11 @@ llama_model_qwen4exp::graph::graph(const llama_model & model, const llm_graph_pa
                 cur = build_layer_attn_linear(inp->get_recr(), cur, il);
             }
         } else {
+            // the skip keeps the K/V and indexer cache writes (their inputs must stay in the graph),
+            // the rest of the layer is pruned with its unused output
+            ggml_tensor * attn_out = build_layer_attn(inp->get_attn(), mctx_hyb, inp_kpool, cur, inp_pos, sections, il);
             if (!qwen4exp_skip("attn")) {
-                cur = build_layer_attn(inp->get_attn(), mctx_hyb, inp_kpool, cur, inp_pos, sections, il);
+                cur = attn_out;
             }
         }
 
