@@ -3769,6 +3769,63 @@ struct test_rms_norm_back : public test_case {
 };
 
 // GGML_OP_RMS_NORM + GGML_OP_MUL + GGML_OP_ADD (+ GGML_OP_MUL)
+// [SCALE +] UNARY [+ SCALE] on one tensor, run as a whole graph so backends can fuse it
+// (NInfer-M1: the qwen4exp hyper-connections compute silu(x/hc) and 2*sigmoid(x/hc))
+struct test_unary_affine : public test_case {
+    const ggml_unary_op uop;
+    const std::array<int64_t, 4> ne;
+    const bool pre;
+    const bool post;
+    const bool strided; // the input is a column slice of a wider tensor
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "UNARY_AFFINE";
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    std::string vars() override {
+        return VARS_TO_STR5(uop, ne, pre, post, strided);
+    }
+
+    test_unary_affine(ggml_unary_op uop = GGML_UNARY_OP_SIGMOID, std::array<int64_t, 4> ne = {4, 5, 1, 1},
+            bool pre = true, bool post = true, bool strided = false)
+        : uop(uop), ne(ne), pre(pre), post(post), strided(strided) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * a = nullptr;
+        if (strided) {
+            ggml_tensor * w = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, ne[0] + 320, ne[1]);
+            ggml_set_param(w);
+            ggml_set_name(w, "w");
+            a = ggml_view_2d(ctx, w, ne[0], ne[1], w->nb[1], ggml_row_size(w->type, 320));
+        } else {
+            a = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne.data());
+            ggml_set_param(a);
+            ggml_set_name(a, "a");
+        }
+
+        ggml_tensor * out = a;
+        if (pre) {
+            out = ggml_scale(ctx, out, 0.25f);
+        }
+        out = ggml_unary(ctx, out, uop);
+        if (post) {
+            out = ggml_scale_bias(ctx, out, 2.0f, 0.5f);
+        }
+        ggml_set_name(out, "out");
+
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            init_tensor_uniform(t, -8.f, 8.f);
+        }
+    }
+};
+
 struct test_rms_norm_mul_add : public test_case {
     const ggml_type type;
     const std::array<int64_t, 4> ne;
@@ -9892,6 +9949,19 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     for (ggml_type set_rows_type : { GGML_TYPE_F32, GGML_TYPE_F16 }) {
         test_cases.emplace_back(new test_rms_norm_mul_rope({ 256, 1, 1, 1 }, 1e-6f, false, true, false, GGML_ROPE_TYPE_NORMAL, false, false, set_rows_type));
         test_cases.emplace_back(new test_rms_norm_mul_rope({ 128, 4, 3, 1 }, 1e-6f, false, true, false, GGML_ROPE_TYPE_NORMAL, false, false, set_rows_type));
+    }
+
+    for (ggml_unary_op uop : { GGML_UNARY_OP_SILU, GGML_UNARY_OP_SIGMOID }) {
+        // the CPU reference SCALE needs a contiguous input, so strided inputs only feed the unary
+        for (bool strided : { false, true }) {
+            for (std::array<int64_t, 4> ne : { std::array<int64_t, 4>{ 4, 5, 1, 1 }, std::array<int64_t, 4>{ 320, 4, 1, 1 }, std::array<int64_t, 4>{ 324, 3, 1, 1 } }) {
+                if (!strided) {
+                    test_cases.emplace_back(new test_unary_affine(uop, ne, true,  true,  strided));
+                    test_cases.emplace_back(new test_unary_affine(uop, ne, true,  false, strided));
+                }
+                test_cases.emplace_back(new test_unary_affine(uop, ne, false, true,  strided));
+            }
+        }
     }
 
     for (float eps : { 0.0f, 1e-6f, 1e-4f, 1e-1f, 1.0f }) {

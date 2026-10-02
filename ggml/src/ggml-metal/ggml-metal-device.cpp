@@ -231,6 +231,12 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_concat(ggml_meta
 }
 
 ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_unary(ggml_metal_library_t lib, const ggml_tensor * op) {
+    return ggml_metal_library_get_pipeline_unary_affine(lib, op, op->src[0], false, false);
+}
+
+// NInfer-M1: `op` decides the function, `src` (the input of the fused group) the layout variant;
+// pre/post apply the SCALEs fused before/after it (GGML_METAL_FUSION_UNARY_AFFINE)
+ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_unary_affine(ggml_metal_library_t lib, const ggml_tensor * op, const ggml_tensor * src, bool pre, bool post) {
     char base[256];
     char name[256];
 
@@ -275,14 +281,14 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_unary(ggml_metal
         default: GGML_ABORT("fatal error");
     };
 
-    const char * t0_str = ggml_type_name(op->src[0]->type);
+    const char * t0_str = ggml_type_name(src->type);
     const char * t_str  = ggml_type_name(op->type);
 
-    const bool is_c4 = op->src[0]->ne[0] % 4 == 0;
-    const bool is_cnt = ggml_is_contiguous(op->src[0]) && ggml_nelements(op) < 32768;
+    const bool is_c4 = src->ne[0] % 4 == 0;
+    const bool is_cnt = ggml_is_contiguous(src) && ggml_nelements(op) < 32768;
 
     snprintf(base, 256, "kernel_unary_%s_%s%s", t0_str, t_str, is_c4 ? "_4" : "");
-    snprintf(name, 256, "%s_op=%d_cnt=%d", base, op_num, is_cnt);
+    snprintf(name, 256, "%s_op=%d_cnt=%d_pre=%d_post=%d", base, op_num, is_cnt, pre, post);
 
     ggml_metal_pipeline_with_params res = ggml_metal_library_get_pipeline(lib, name);
     if (!res.pipeline) {
@@ -290,6 +296,8 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_unary(ggml_metal
 
         ggml_metal_cv_set_int16(cv, op_num, FC_UNARY + 0);
         ggml_metal_cv_set_bool (cv, is_cnt, FC_UNARY + 1);
+        ggml_metal_cv_set_bool (cv, pre,    FC_UNARY + 2);
+        ggml_metal_cv_set_bool (cv, post,   FC_UNARY + 3);
 
         res = ggml_metal_library_compile_pipeline(lib, base, name, cv);
 

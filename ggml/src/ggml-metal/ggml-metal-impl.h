@@ -236,6 +236,10 @@ typedef struct {
     float    val;
     float    min;
     float    max;
+    float    pre_scale;  // fused SCALE before the op (FC_unary_pre)
+    float    pre_bias;
+    float    post_scale; // fused SCALE after the op (FC_unary_post)
+    float    post_bias;
 } ggml_metal_kargs_unary;
 
 typedef struct {

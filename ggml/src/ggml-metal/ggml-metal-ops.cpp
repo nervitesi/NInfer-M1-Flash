@@ -860,15 +860,40 @@ int ggml_metal_op_unary(ggml_metal_op_t ctx, int idx) {
     ggml_metal_library_t lib = ctx->lib;
     ggml_metal_encoder_t enc = ctx->enc;
 
-    GGML_TENSOR_LOCALS( int32_t, ne0, op->src[0], ne);
-    GGML_TENSOR_LOCALS(uint64_t, nb0, op->src[0], nb);
-    GGML_TENSOR_LOCALS( int32_t, ne,  op,         ne);
-    GGML_TENSOR_LOCALS(uint64_t, nb,  op,         nb);
+    // NInfer-M1: [SCALE +] UNARY [+ SCALE] in one dispatch; `op` becomes the UNARY node, the input
+    // is the group's input and the output the group's last node
+    int n_fuse = 1;
+    const ggml_tensor * fsrc  = op->src[0];
+    const ggml_tensor * fdst  = op;
+    const ggml_tensor * f_pre  = nullptr;
+    const ggml_tensor * f_post = nullptr;
 
-    GGML_ASSERT(ggml_is_contiguous_rows(op->src[0]));
+    if (ctx->use_fusion()) {
+        int n = 1;
+        const ggml_metal_fusion * fusion = ctx->can_fuse(idx, GGML_METAL_FUSION_FULL, &n);
+        if (fusion && ggml_metal_fusion_get_id(fusion) == GGML_METAL_FUSION_UNARY_AFFINE && n >= 2) {
+            n_fuse = n;
+            fdst   = ctx->node(idx + n - 1);
+            if (op->op == GGML_OP_SCALE) {
+                f_pre = op;
+                op    = ctx->node(idx + 1);
+            }
+            if (fdst != op) {
+                f_post = fdst;
+            }
+            ctx->count_fusions(fusion);
+        }
+    }
 
-    ggml_metal_buffer_id bid_src0 = ggml_metal_get_buffer_id(op->src[0]);
-    ggml_metal_buffer_id bid_dst  = ggml_metal_get_buffer_id(op);
+    GGML_TENSOR_LOCALS( int32_t, ne0, fsrc, ne);
+    GGML_TENSOR_LOCALS(uint64_t, nb0, fsrc, nb);
+    GGML_TENSOR_LOCALS( int32_t, ne,  fdst, ne);
+    GGML_TENSOR_LOCALS(uint64_t, nb,  fdst, nb);
+
+    GGML_ASSERT(ggml_is_contiguous_rows(fsrc));
+
+    ggml_metal_buffer_id bid_src0 = ggml_metal_get_buffer_id(fsrc);
+    ggml_metal_buffer_id bid_dst  = ggml_metal_get_buffer_id(fdst);
 
     ggml_metal_kargs_unary args = {
         /*.ne00  =*/ ne00,
@@ -920,7 +945,16 @@ int ggml_metal_op_unary(ggml_metal_op_t ctx, int idx) {
         args.val   = ggml_get_op_params_f32(op, 4); // eps
     }
 
-    auto pipeline = ggml_metal_library_get_pipeline_unary(lib, op);
+    if (f_pre) {
+        args.pre_scale = ggml_get_op_params_f32(f_pre, 0);
+        args.pre_bias  = ggml_get_op_params_f32(f_pre, 1);
+    }
+    if (f_post) {
+        args.post_scale = ggml_get_op_params_f32(f_post, 0);
+        args.post_bias  = ggml_get_op_params_f32(f_post, 1);
+    }
+
+    auto pipeline = ggml_metal_library_get_pipeline_unary_affine(lib, op, fsrc, f_pre != nullptr, f_post != nullptr);
 
     if (pipeline.c4) {
         args.ne00 = ne00/4;
@@ -933,7 +967,7 @@ int ggml_metal_op_unary(ggml_metal_op_t ctx, int idx) {
     ggml_metal_encoder_set_buffer  (enc, bid_dst,  2);
 
     if (pipeline.cnt) {
-        const int n = pipeline.c4 ? ggml_nelements(op)/4 : ggml_nelements(op);
+        const int n = pipeline.c4 ? ggml_nelements(fdst)/4 : ggml_nelements(fdst);
 
         ggml_metal_encoder_dispatch_threadgroups(enc, n, 1, 1, 1, 1, 1);
     } else {
@@ -944,7 +978,7 @@ int ggml_metal_op_unary(ggml_metal_op_t ctx, int idx) {
         ggml_metal_encoder_dispatch_threadgroups(enc, nk0*ne01, ne02, ne03, nth, 1, 1);
     }
 
-    return 1;
+    return n_fuse;
 }
 
 int ggml_metal_op_glu(ggml_metal_op_t ctx, int idx) {

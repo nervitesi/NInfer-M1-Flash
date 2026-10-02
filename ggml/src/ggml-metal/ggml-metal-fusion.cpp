@@ -170,6 +170,66 @@ static bool ggml_metal_fusion_check_ssm_conv_silu(
     return true;
 }
 
+// [SCALE +] UNARY [+ SCALE] (NInfer-M1): elementwise chain on one tensor, the SCALEs become the
+// pre/post affine of the unary kernel; e.g. the hyper-connection silu(x/hc) and 2*sigmoid(x/hc)
+static bool ggml_metal_fusion_check_unary_affine(
+        const ggml_metal_fusion      * fusion,
+        const ggml_tensor * const    * nodes,
+        const ggml_cgraph            * gf,
+        const int                    * node_idxs,
+              int                      idx,
+              ggml_metal_fusion_mode   mode) {
+    GGML_UNUSED(gf);
+    GGML_UNUSED(node_idxs);
+    GGML_UNUSED(idx);
+    GGML_UNUSED(mode);
+
+    const int n = (int) fusion->ops.size();
+
+    for (int j = 0; j < n; ++j) {
+        const ggml_tensor * t = nodes[j];
+
+        if (t->type != GGML_TYPE_F32 || !ggml_are_same_shape(t, nodes[0])) {
+            return false;
+        }
+        if (j > 0 && t->src[0] != nodes[j - 1]) {
+            return false;
+        }
+        if (j > 0 && !ggml_is_contiguous(t->src[0])) {
+            return false;
+        }
+        if (t->op == GGML_OP_SCALE) {
+            if (t->src[1]) {
+                return false;
+            }
+            continue;
+        }
+        if (t->op != GGML_OP_UNARY || t->src[1]) {
+            return false;
+        }
+        switch (ggml_get_unary_op(t)) {
+            case GGML_UNARY_OP_SILU:
+            case GGML_UNARY_OP_SIGMOID:
+            case GGML_UNARY_OP_GELU:
+            case GGML_UNARY_OP_GELU_ERF:
+            case GGML_UNARY_OP_GELU_QUICK:
+            case GGML_UNARY_OP_TANH:
+            case GGML_UNARY_OP_RELU:
+            case GGML_UNARY_OP_EXP:
+            case GGML_UNARY_OP_SOFTPLUS:
+            case GGML_UNARY_OP_NEG:
+            case GGML_UNARY_OP_ABS:
+                break;
+            default:
+                return false;
+        }
+    }
+
+    const ggml_tensor * src = nodes[0]->src[0];
+
+    return src && src->type == GGML_TYPE_F32 && ggml_is_contiguous_rows(src) && ggml_is_contiguous(nodes[n - 1]);
+}
+
 // ADD x N: each ADD reads the previous ADD as src0, and all addends must share layout
 // (and, in FULL mode, live in the same Metal buffer)
 static bool ggml_metal_fusion_check_add_chain(
@@ -641,6 +701,10 @@ static const std::vector<ggml_op> ops_gdn_cache = { GGML_OP_GATED_DELTA_NET, GGM
 
 static const std::vector<ggml_op> ops_ssm_conv_silu = { GGML_OP_SSM_CONV, GGML_OP_UNARY };
 
+static const std::vector<ggml_op> ops_unary_affine_pre_post = { GGML_OP_SCALE, GGML_OP_UNARY, GGML_OP_SCALE };
+static const std::vector<ggml_op> ops_unary_affine_pre      = { GGML_OP_SCALE, GGML_OP_UNARY };
+static const std::vector<ggml_op> ops_unary_affine_post     = { GGML_OP_UNARY, GGML_OP_SCALE };
+
 static const std::vector<ggml_op> ops_moe_reduce_2 = {
     GGML_OP_MUL, GGML_OP_VIEW, GGML_OP_VIEW, GGML_OP_ADD
 };
@@ -696,6 +760,9 @@ static const std::vector<ggml_metal_fusion> ggml_metal_fusions = {
     { GGML_METAL_FUSION_MOE_REDUCE,     ops_moe_reduce_7,           {},     true,  ggml_metal_fusion_check_moe_reduce },
     { GGML_METAL_FUSION_MOE_REDUCE,     ops_moe_reduce_8,           {},     true,  ggml_metal_fusion_check_moe_reduce },
     { GGML_METAL_FUSION_SSM_CONV_SILU,  ops_ssm_conv_silu,          {},     false, ggml_metal_fusion_check_ssm_conv_silu },
+    { GGML_METAL_FUSION_UNARY_AFFINE,   ops_unary_affine_pre_post,  {},     false, ggml_metal_fusion_check_unary_affine },
+    { GGML_METAL_FUSION_UNARY_AFFINE,   ops_unary_affine_pre,       {},     false, ggml_metal_fusion_check_unary_affine },
+    { GGML_METAL_FUSION_UNARY_AFFINE,   ops_unary_affine_post,      {},     false, ggml_metal_fusion_check_unary_affine },
 };
 
 // ---- alloc deps -----------------------------------------------------------

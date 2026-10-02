@@ -2,6 +2,8 @@
 
 constant short FC_unary_op [[function_constant(FC_UNARY + 0)]];
 constant bool  FC_unary_cnt[[function_constant(FC_UNARY + 1)]];
+constant bool  FC_unary_pre [[function_constant(FC_UNARY + 2)]];
+constant bool  FC_unary_post[[function_constant(FC_UNARY + 3)]];
 
 template <typename T0, typename T, typename TC>
 kernel void kernel_unary_impl(
@@ -45,127 +47,134 @@ kernel void kernel_unary_impl(
             }
         }
 
-        const TC x = (TC) src0_ptr[i0];
+        TC x = (TC) src0_ptr[i0];
+
+        // NInfer-M1: a SCALE fused before and/or after the op (GGML_METAL_FUSION_UNARY_AFFINE)
+        if (FC_unary_pre) {
+            x = TC(args.pre_scale)*x + TC(args.pre_bias);
+        }
+
+        TC y = x;
 
         if (FC_OP == OP_UNARY_NUM_SCALE) {
-            dst_ptr[i0] = (T) (args.scale * x + args.bias);
+            y = (TC) (args.scale * x + args.bias);
         }
 
         if (FC_OP == OP_UNARY_NUM_FILL) {
-            dst_ptr[i0] = (T) args.val;
+            y = (TC) args.val;
         }
 
         if (FC_OP == OP_UNARY_NUM_CLAMP) {
-            dst_ptr[i0] = (T) clamp(x, args.min, args.max);
+            y = (TC) clamp(x, args.min, args.max);
         }
 
         if (FC_OP == OP_UNARY_NUM_SQR) {
-            dst_ptr[i0] = (T) (x * x);
+            y = (TC) (x * x);
         }
 
         if (FC_OP == OP_UNARY_NUM_SQRT) {
-            dst_ptr[i0] = (T) sqrt(x);
+            y = (TC) sqrt(x);
         }
 
         if (FC_OP == OP_UNARY_NUM_SIN) {
-            dst_ptr[i0] = (T) sin(x);
+            y = (TC) sin(x);
         }
 
         if (FC_OP == OP_UNARY_NUM_COS) {
-            dst_ptr[i0] = (T) cos(x);
+            y = (TC) cos(x);
         }
 
         if (FC_OP == OP_UNARY_NUM_LOG) {
-            dst_ptr[i0] = (T) log(x);
+            y = (TC) log(x);
         }
 
         if (FC_OP == OP_UNARY_NUM_LEAKY_RELU) {
-            dst_ptr[i0] = (T) (TC(x > 0)*x + TC(x <= 0)*(x * args.slope));
+            y = (TC) (TC(x > 0)*x + TC(x <= 0)*(x * args.slope));
         }
 
         if (FC_OP == OP_UNARY_NUM_TANH) {
-            dst_ptr[i0] = (T) precise::tanh(x);
+            y = (TC) precise::tanh(x);
         }
 
         if (FC_OP == OP_UNARY_NUM_RELU) {
-            dst_ptr[i0] = (T) fmax(0, x);
+            y = (TC) fmax(0, x);
         }
 
         if (FC_OP == OP_UNARY_NUM_SIGMOID) {
-            dst_ptr[i0] = (T) (1 / (1 + exp(-x)));
+            y = (TC) (1 / (1 + exp(-x)));
         }
 
         if (FC_OP == OP_UNARY_NUM_GELU) {
-            dst_ptr[i0] = (T) (0.5*x*(1 + precise::tanh(SQRT_2_OVER_PI*x*(1 + GELU_COEF_A*x*x))));
+            y = (TC) (0.5*x*(1 + precise::tanh(SQRT_2_OVER_PI*x*(1 + GELU_COEF_A*x*x))));
         }
 
         if (FC_OP == OP_UNARY_NUM_GELU_ERF) {
-            dst_ptr[i0] = (T) (0.5*x*(1 + erf_approx(SQRT_2_INV*x)));
+            y = (TC) (0.5*x*(1 + erf_approx(SQRT_2_INV*x)));
         }
 
         if (FC_OP == OP_UNARY_NUM_GELU_QUICK) {
-            dst_ptr[i0] = (T) (x * (1/(1 + exp(GELU_QUICK_COEF*x))));
+            y = (TC) (x * (1/(1 + exp(GELU_QUICK_COEF*x))));
         }
 
         if (FC_OP == OP_UNARY_NUM_SILU) {
-            dst_ptr[i0] = (T) (x / (1 + exp(-x)));
+            y = (TC) (x / (1 + exp(-x)));
         }
 
         if (FC_OP == OP_UNARY_NUM_ELU) {
-            dst_ptr[i0] = (T) elu_approx(x);
+            y = (TC) elu_approx(x);
         }
 
         if (FC_OP == OP_UNARY_NUM_NEG) {
-            dst_ptr[i0] = (T) -x;
+            y = (TC) -x;
         }
 
         if (FC_OP == OP_UNARY_NUM_ABS) {
-            dst_ptr[i0] = (T) fabs(x);
+            y = (TC) fabs(x);
         }
 
         if (FC_OP == OP_UNARY_NUM_SGN) {
-            dst_ptr[i0] = T(x > 0) - T(x < 0);
+            y = TC(x > 0) - TC(x < 0);
         }
 
         if (FC_OP == OP_UNARY_NUM_STEP) {
-            dst_ptr[i0] = T(x > 0);
+            y = TC(x > 0);
         }
 
         if (FC_OP == OP_UNARY_NUM_HARDSWISH) {
-            dst_ptr[i0] = (T) (x * fmax(0, fmin(1, x/6 + 0.5)));
+            y = (TC) (x * fmax(0, fmin(1, x/6 + 0.5)));
         }
 
         if (FC_OP == OP_UNARY_NUM_HARDSIGMOID) {
-            dst_ptr[i0] = (T) fmax(0, fmin(1, x/6 + 0.5));
+            y = (TC) fmax(0, fmin(1, x/6 + 0.5));
         }
 
         if (FC_OP == OP_UNARY_NUM_EXP) {
-            dst_ptr[i0] = (T) exp(x);
+            y = (TC) exp(x);
         }
 
         if (FC_OP == OP_UNARY_NUM_SOFTPLUS) {
-            dst_ptr[i0] = (T) select(log(1 + exp(x)), x, x > 20);
+            y = (TC) select(log(1 + exp(x)), x, x > 20);
         }
 
         if (FC_OP == OP_UNARY_NUM_EXPM1) {
             // TODO: precise implementation
-            dst_ptr[i0] = (T) (exp(x) - 1);
+            y = (TC) (exp(x) - 1);
         }
 
         if (FC_OP == OP_UNARY_NUM_FLOOR) {
-            dst_ptr[i0] = (T) floor(x);
+            y = (TC) floor(x);
         }
 
         if (FC_OP == OP_UNARY_NUM_CEIL) {
-            dst_ptr[i0] = (T) ceil(x);
+            y = (TC) ceil(x);
         }
 
         if (FC_OP == OP_UNARY_NUM_ROUND) {
-            dst_ptr[i0] = (T) round(x);
+            y = (TC) round(x);
         }
 
         if (FC_OP == OP_UNARY_NUM_TRUNC) {
-            dst_ptr[i0] = (T) trunc(x);
+            y = (TC) trunc(x);
         }
 
         if (FC_OP == OP_UNARY_NUM_XIELU) {
@@ -174,8 +183,14 @@ kernel void kernel_unary_impl(
             const TC clamped = fmin(xi, TC(args.val));
             const TC y_pos   = TC(args.scale) * xi * xi + TC(args.bias) * xi;
             const TC y_neg   = (exp(clamped) - TC(1.0f) - xi) * TC(args.slope) + TC(args.bias) * xi;
-            dst_ptr[i0] = (T) (gate * y_pos + (TC(1.0f) - gate) * y_neg);
+            y = (TC) (gate * y_pos + (TC(1.0f) - gate) * y_neg);
         }
+
+        if (FC_unary_post) {
+            y = TC(args.post_scale)*y + TC(args.post_bias);
+        }
+
+        dst_ptr[i0] = (T) y;
     }
 
 #undef FC_OP
