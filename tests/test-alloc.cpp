@@ -615,6 +615,41 @@ static void test_reallocation() {
     }
 }
 
+// a leaf that no node reads (kept allocated for the application) grows while the graph keeps its
+// node count: the previous assignment must not be reused, else it overflows into the next leaf
+static ggml_tensor * build_unused_leaf_graph(ggml_context * ctx, ggml_cgraph * graph, size_t unused_size, ggml_tensor ** unused, ggml_tensor ** used) {
+    *unused = make_input_with_size(ctx, unused_size);
+    *used   = make_input_with_size(ctx, 16);
+    ggml_tensor * out = ggml_scale(ctx, *used, 2.0f);
+    assign_names(ctx);
+    ggml_build_forward_expand(graph, *unused);
+    ggml_set_output(out);
+    ggml_build_forward_expand(graph, out);
+    return out;
+}
+
+static void test_unused_leaf_grows() {
+    dummy_backend    backend = dummy_backend_init(SIZE_MAX, /*align*/ 4);
+    ggml_gallocr_ptr galloc  = ggml_gallocr_ptr(ggml_gallocr_new(&backend.buffer_type));
+    {
+        auto [ctx, graph, ctx_ptr] = make_context();
+        ggml_tensor * unused;
+        ggml_tensor * used;
+        build_unused_leaf_graph(ctx, graph, 8, &unused, &used);
+        GGML_ASSERT(ggml_gallocr_alloc_graph(galloc.get(), graph));
+    }
+    {
+        auto [ctx, graph, ctx_ptr] = make_context();
+        ggml_tensor * unused;
+        ggml_tensor * used;
+        build_unused_leaf_graph(ctx, graph, 64, &unused, &used);
+        GGML_ASSERT(ggml_gallocr_alloc_graph(galloc.get(), graph));
+        const uint8_t * a = (const uint8_t *) unused->data;
+        const uint8_t * b = (const uint8_t *) used->data;
+        GGML_ASSERT(a + ggml_nbytes(unused) <= b || b + ggml_nbytes(used) <= a);
+    }
+}
+
 static void test_backend_graph_optimize(ggml_backend_t, ggml_cgraph * graph, ggml_backend_graph_optimize_params * params) {
     GGML_ASSERT(graph->n_nodes == 3);
     params->add_alloc_dep(params->user_data, graph->nodes[0], graph->nodes[2]);
@@ -671,6 +706,7 @@ int main() {
     run("test_multiple_buffer_types", test_multiple_buffer_types);
     run("test_buffer_size_zero", test_buffer_size_zero);
     run("test_reallocation", test_reallocation);
+    run("test_unused_leaf_grows", test_unused_leaf_grows);
     run("test_graph_optimize_alloc_dep", test_graph_optimize_alloc_dep);
     return 0;
 }
