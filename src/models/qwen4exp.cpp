@@ -383,6 +383,16 @@ std::unique_ptr<llm_graph_context> llama_model_qwen4exp::build_arch_graph(const 
     return std::make_unique<graph>(*this, params);
 }
 
+// NInfer-M1 timing diagnostic: LLAMA_QWEN4EXP_SKIP="gdn,attn,moe,shexp,hcmix" replaces those blocks with
+// a pass-through, so the time that disappears is their cost. The output is wrong while it is set.
+static bool qwen4exp_skip(const char * what) {
+    static const std::string env = [] { const char * s = getenv("LLAMA_QWEN4EXP_SKIP"); return std::string(s ? s : ""); }();
+    if (env.empty()) {
+        return false;
+    }
+    return ("," + env + ",").find("," + std::string(what) + ",") != std::string::npos;
+}
+
 // Hyper-connections keep hc parallel residual streams [n_embd, hc, T] in place of layer norms.
 // Returns the mixed [n_embd, T] stream; `inject` gets the [hc, T] scatter weights.
 ggml_tensor * llama_model_qwen4exp::graph::build_hc_mix(
@@ -397,6 +407,13 @@ ggml_tensor * llama_model_qwen4exp::graph::build_hc_mix(
     const int64_t hc     = hparams.dsv4_hc_mult;
     const int64_t hc_dim = hc * n_embd;
     const int64_t nt     = x->ne[2];
+
+    if (il >= 0 && qwen4exp_skip("hcmix")) {
+        if (inject) {
+            *inject = ggml_view_2d(ctx0, x, hc, nt, x->nb[2], 0);
+        }
+        return ggml_cont(ctx0, ggml_view_2d(ctx0, x, n_embd, nt, x->nb[2], 0));
+    }
 
     // grouped RMSNorm: reduce over one stream, then scale all streams with the [n_embd, hc] gamma
     // the converter folded each gamma to (1 + w)
@@ -541,9 +558,13 @@ llama_model_qwen4exp::graph::graph(const llama_model & model, const llm_graph_pa
         ggml_build_forward_expand(gf, cur);
 
         if (hparams.is_recr(il)) {
-            cur = build_layer_attn_linear(inp->get_recr(), cur, il);
+            if (!qwen4exp_skip("gdn")) {
+                cur = build_layer_attn_linear(inp->get_recr(), cur, il);
+            }
         } else {
-            cur = build_layer_attn(inp->get_attn(), mctx_hyb, inp_kpool, cur, inp_pos, sections, il);
+            if (!qwen4exp_skip("attn")) {
+                cur = build_layer_attn(inp->get_attn(), mctx_hyb, inp_kpool, cur, inp_pos, sections, il);
+            }
         }
 
         const bool gather_now = !cparams.embeddings_nextn || cparams.embeddings_nextn_masked;
@@ -1357,7 +1378,7 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_attn_linear(
 ggml_tensor * llama_model_qwen4exp::graph::build_layer_ffn(ggml_tensor * cur, const int il) {
     GGML_ASSERT(model.layers[il].ffn_gate_inp != nullptr);
 
-    ggml_tensor * moe_out =
+    ggml_tensor * moe_out = qwen4exp_skip("moe") ? cur :
         build_moe_ffn(cur,
             model.layers[il].ffn_gate_inp,
             model.layers[il].ffn_up_exps,
@@ -1375,7 +1396,7 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_ffn(ggml_tensor * cur, co
     cb(moe_out, "ffn_moe_out", il);
 
     // shared experts, as in the Qwen3Next reference
-    if (model.layers[il].ffn_up_shexp != nullptr || model.layers[il].ffn_gate_up_shexp != nullptr) {
+    if (!qwen4exp_skip("shexp") && (model.layers[il].ffn_up_shexp != nullptr || model.layers[il].ffn_gate_up_shexp != nullptr)) {
         // merged gate|up: one matmul, swiglu splits the halves
         ggml_tensor * ffn_shexp = model.layers[il].ffn_gate_up_shexp ?
             build_ffn(cur,
