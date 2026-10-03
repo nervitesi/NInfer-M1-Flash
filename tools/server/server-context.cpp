@@ -943,6 +943,10 @@ private:
     //
 
     static constexpr char prompt_cache_magic[8] = {'N', 'I', 'P', 'C', 'A', 'C', 'H', '1'};
+    // a slot whose state does not fit the RAM cache (e.g. a 65k conversation with its checkpoints,
+    // 9-11 GB) is written straight to disk at exit: slot-<id>.nipc holds tokens and checkpoints,
+    // slot-<id>.tgt.state / .dft.state the sequence states, streamed by llama_state_seq_save_file
+    static constexpr char prompt_slot_magic[8] = {'N', 'I', 'P', 'S', 'L', 'O', 'T', '1'};
 
     std::string prompt_cache_fingerprint() const {
         std::string s;
@@ -968,9 +972,21 @@ private:
         }
         const int64_t t_start = ggml_time_us();
 
+        std::vector<server_slot *> too_large;
         for (auto & slot : slots) {
             if (slot.prompt_save(*prompt_cache)) {
                 prompt_cache->update();
+                continue;
+            }
+            if (slot.prompt.tokens.size() == 0) {
+                continue;
+            }
+            bool covered = false;
+            for (const auto & st : prompt_cache->states) {
+                covered = covered || st.prompt.tokens.get_common_prefix(slot.prompt.tokens) == (int) slot.prompt.tokens.size();
+            }
+            if (!covered) {
+                too_large.push_back(&slot);
             }
         }
 
@@ -978,12 +994,17 @@ private:
         std::error_code ec;
         fs::create_directories(dir, ec);
         for (const auto & f : fs::directory_iterator(dir, ec)) {
-            if (f.path().extension() == ".nipc") {
+            if (f.path().extension() == ".nipc" || f.path().extension() == ".state" || f.path().extension() == ".partial") {
                 fs::remove(f.path(), ec);
             }
         }
 
         const std::string fp = prompt_cache_fingerprint();
+
+        for (server_slot * slot : too_large) {
+            persist_slot_direct(*slot, dir, fp);
+        }
+
         size_t n_files = 0, n_bytes = 0;
         int idx = 0;
         for (const auto & st : prompt_cache->states) {
@@ -1026,6 +1047,144 @@ private:
                 dir.string().c_str(), (ggml_time_us() - t_start)/1e6);
     }
 
+    void persist_slot_direct(server_slot & slot, const std::filesystem::path & dir, const std::string & fp) {
+        namespace fs = std::filesystem;
+        const int64_t t_start = ggml_time_us();
+        llama_tokens tokens;
+        try {
+            tokens = slot.prompt.tokens.get_tokens();
+        } catch (...) {
+            return; // multimodal prompts are not persisted
+        }
+        const std::string base = "slot-" + std::to_string(slot.id);
+        const fs::path meta = dir / (base + ".nipc");
+        const fs::path tgt  = dir / (base + ".tgt.state");
+        const fs::path dft  = dir / (base + ".dft.state");
+        std::error_code ec;
+
+        // states first, through .partial names, so a missing or truncated file never pairs with a header
+        const fs::path tgt_tmp = dir / (base + ".tgt.state.partial");
+        if (llama_state_seq_save_file(ctx_tgt, tgt_tmp.string().c_str(), slot.id, tokens.data(), tokens.size()) == 0) {
+            SRV_WRN("prompt cache: failed to save slot %d state\n", slot.id);
+            fs::remove(tgt_tmp, ec);
+            return;
+        }
+        if (ctx_dft) {
+            const fs::path dft_tmp = dir / (base + ".dft.state.partial");
+            if (llama_state_seq_save_file(ctx_dft, dft_tmp.string().c_str(), slot.id, tokens.data(), tokens.size()) == 0) {
+                SRV_WRN("prompt cache: failed to save slot %d draft state\n", slot.id);
+                fs::remove(tgt_tmp, ec);
+                fs::remove(dft_tmp, ec);
+                return;
+            }
+            fs::rename(dft_tmp, dft, ec);
+        }
+        fs::rename(tgt_tmp, tgt, ec);
+
+        const fs::path meta_tmp = dir / (base + ".nipc.partial");
+        std::ofstream out(meta_tmp, std::ios::binary);
+        auto put_u64 = [&](uint64_t v) { out.write((const char *) &v, sizeof(v)); };
+        auto put_buf = [&](const void * p, size_t n) { put_u64(n); out.write((const char *) p, n); };
+        out.write(prompt_slot_magic, sizeof(prompt_slot_magic));
+        put_buf(fp.data(), fp.size());
+        put_u64((uint64_t) slot.id);
+        put_u64((uint64_t) (ctx_dft != nullptr));
+        put_buf(tokens.data(), tokens.size()*sizeof(llama_token));
+        put_u64(slot.prompt.checkpoints.size());
+        size_t ckpt_bytes = 0;
+        for (const auto & c : slot.prompt.checkpoints) {
+            const int64_t hdr[4] = { c.n_tokens, c.id_task, c.pos_min, c.pos_max };
+            out.write((const char *) hdr, sizeof(hdr));
+            put_buf(c.data_tgt.data(),  c.data_tgt.size());
+            put_buf(c.data_dft.data(),  c.data_dft.size());
+            put_buf(c.data_spec.data(), c.data_spec.size());
+            ckpt_bytes += c.data_tgt.size() + c.data_dft.size() + c.data_spec.size();
+        }
+        out.close();
+        if (!out) {
+            SRV_WRN("prompt cache: failed to write %s\n", meta_tmp.string().c_str());
+            fs::remove(meta_tmp, ec);
+            fs::remove(tgt, ec);
+            fs::remove(dft, ec);
+            return;
+        }
+        fs::rename(meta_tmp, meta, ec);
+        const double mib = (fs::file_size(tgt, ec) + (ctx_dft ? fs::file_size(dft, ec) : 0) + ckpt_bytes)/1024.0/1024.0;
+        SRV_INF("prompt cache: saved slot %d directly to disk (%zu tokens, %zu checkpoints, %.1f MiB) in %.2f s\n",
+                slot.id, tokens.size(), slot.prompt.checkpoints.size(), mib, (ggml_time_us() - t_start)/1e6);
+    }
+
+    void restore_slots_direct(const std::filesystem::path & dir, const std::string & fp) {
+        namespace fs = std::filesystem;
+        std::error_code ec;
+        for (const auto & f : fs::directory_iterator(dir, ec)) {
+            const fs::path path = f.path();
+            if (path.extension() != ".nipc" || path.filename().string().rfind("slot-", 0) != 0) {
+                continue;
+            }
+            const int64_t t_start = ggml_time_us();
+            std::ifstream in(path, std::ios::binary);
+            char magic[8] = {};
+            in.read(magic, sizeof(magic));
+            auto get_u64 = [&]() { uint64_t v = 0; in.read((char *) &v, sizeof(v)); return v; };
+            auto get_buf = [&](std::vector<uint8_t> & v) { v.resize(get_u64()); in.read((char *) v.data(), v.size()); };
+            if (!in || memcmp(magic, prompt_slot_magic, sizeof(magic)) != 0) {
+                continue;
+            }
+            std::vector<uint8_t> buf;
+            get_buf(buf);
+            if (!in || std::string(buf.begin(), buf.end()) != fp) {
+                SRV_WRN("prompt cache: %s was saved with other models or settings, skipping\n", path.filename().string().c_str());
+                continue;
+            }
+            const int  id      = (int) get_u64();
+            const bool has_dft = get_u64() != 0;
+            get_buf(buf);
+            llama_tokens tokens(buf.size()/sizeof(llama_token));
+            memcpy(tokens.data(), buf.data(), tokens.size()*sizeof(llama_token));
+            std::list<common_prompt_checkpoint> checkpoints;
+            const uint64_t n_ckpt = get_u64();
+            for (uint64_t i = 0; i < n_ckpt && in; ++i) {
+                int64_t hdr[4];
+                in.read((char *) hdr, sizeof(hdr));
+                common_prompt_checkpoint c;
+                c.n_tokens = hdr[0];
+                c.id_task  = (int) hdr[1];
+                c.pos_min  = (llama_pos) hdr[2];
+                c.pos_max  = (llama_pos) hdr[3];
+                get_buf(c.data_tgt);
+                get_buf(c.data_dft);
+                get_buf(c.data_spec);
+                checkpoints.push_back(std::move(c));
+            }
+            if (!in || id < 0 || id >= (int) slots.size() || has_dft != (ctx_dft != nullptr) || tokens.empty()) {
+                SRV_WRN("prompt cache: %s does not match this server (slot, draft or truncated), skipping\n", path.filename().string().c_str());
+                continue;
+            }
+            server_slot & slot = slots[id];
+            const std::string base = "slot-" + std::to_string(id);
+            auto load = [&](llama_context * ctx, const fs::path & p) {
+                llama_tokens got(tokens.size());
+                size_t n_got = 0;
+                const size_t res = llama_state_seq_load_file(ctx, p.string().c_str(), id, got.data(), got.size(), &n_got);
+                return res != 0 && n_got == tokens.size() && got == tokens;
+            };
+            bool ok = load(ctx_tgt, dir / (base + ".tgt.state"));
+            if (ok && ctx_dft) {
+                ok = load(ctx_dft, dir / (base + ".dft.state"));
+            }
+            if (!ok) {
+                SRV_WRN("prompt cache: failed to load the states of %s, skipping\n", path.filename().string().c_str());
+                slot.mem.seq_rm(id, -1, -1);
+                continue;
+            }
+            slot.prompt.tokens      = server_tokens(tokens, false);
+            slot.prompt.checkpoints = std::move(checkpoints);
+            SRV_INF("prompt cache: restored slot %d from disk (%zu tokens, %zu checkpoints) in %.2f s\n",
+                    id, tokens.size(), slot.prompt.checkpoints.size(), (ggml_time_us() - t_start)/1e6);
+        }
+    }
+
     void restore_prompt_cache() {
         namespace fs = std::filesystem;
         const fs::path dir(params_base.prompt_cache_dir);
@@ -1036,7 +1195,7 @@ private:
         const int64_t t_start = ggml_time_us();
         std::vector<fs::path> files;
         for (const auto & f : fs::directory_iterator(dir, ec)) {
-            if (f.path().extension() == ".nipc") {
+            if (f.path().extension() == ".nipc" && f.path().filename().string().rfind("slot-", 0) != 0) {
                 files.push_back(f.path());
             }
         }
@@ -1096,6 +1255,8 @@ private:
         prompt_cache->update();
         SRV_INF("prompt cache: restored %zu of %zu entries, %.1f MiB from %s in %.2f s\n", n_ok, files.size(),
                 n_bytes/1024.0/1024.0, dir.string().c_str(), (ggml_time_us() - t_start)/1e6);
+
+        restore_slots_direct(dir, fp);
     }
 
     void destroy() {
