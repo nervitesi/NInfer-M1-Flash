@@ -1361,6 +1361,9 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
     std::vector<int>                i_last;
     std::vector<std::vector<float>> chain_h;
 
+    // draws the sampled drafts of speculative sampling (see draw_q)
+    std::mt19937 rs_rng{0x5eed1234u};
+
     common_speculative_impl_draft_mtp(const common_params_speculative & params, uint32_t n_seq)
         : common_speculative_impl(COMMON_SPECULATIVE_TYPE_DRAFT_MTP, n_seq, params.draft.n_max)
         , params(params.draft)
@@ -1621,6 +1624,10 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             drafting[seq_id] = true;
             common_sampler_reset(smpls[seq_id].get());
 
+            if (dp.result_q) {
+                dp.result_q->clear();
+            }
+
             common_batch_add(batch, dp.id_last, dp.pos0, { seq_id }, true);
             std::memcpy(batch.embd + (size_t) (batch.n_tokens - 1) * n_embd, pending_h[seq_id].data(), row_bytes);
 
@@ -1680,7 +1687,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                 }
 
                 // add drafted token for each sequence
-                const llama_token id = cur_p->data[0].id;
+                llama_token id = cur_p->data[0].id;
 
                 // only collect very high-confidence draft tokens
                 if (cur_p->data[0].p < params.p_min) {
@@ -1690,9 +1697,16 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                     continue;
                 }
 
+                auto & dp = dparams.at(seq_id);
+
+                if (dp.temp > 0.0f && dp.result_q) {
+                    // speculative sampling: draw the draft token from the drafter's own distribution at the
+                    // target temperature and top-p, and keep that distribution for the verification
+                    id = draw_q(cur_p, dp.temp, dp.top_p, dp.result_q->emplace_back());
+                }
+
                 common_sampler_accept(smpl, id, true);
 
-                auto & dp = dparams.at(seq_id);
                 auto & result = *dp.result;
 
                 result.push_back(id);
@@ -1746,8 +1760,55 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
             if (dp.result->size() < (size_t) params.n_min) {
                 dp.result->clear();
+                if (dp.result_q) {
+                    dp.result_q->clear();
+                }
             }
         }
+    }
+
+    // draft distribution q: softmax of the candidate logits at temperature temp, cut to the smallest
+    // prefix (by probability) whose mass reaches top_p, renormalized; returns a token drawn from q
+    llama_token draw_q(const llama_token_data_array * cur_p, float temp, float top_p, std::vector<llama_token_data> & q) {
+        q.assign(cur_p->data, cur_p->data + cur_p->size);
+        std::sort(q.begin(), q.end(), [](const llama_token_data & a, const llama_token_data & b) { return a.logit > b.logit; });
+
+        const float l_max = q[0].logit;
+        double sum = 0.0;
+        for (auto & t : q) {
+            t.p = std::isfinite(t.logit) ? expf((t.logit - l_max)/temp) : 0.0f;
+            sum += t.p;
+        }
+
+        double cum = 0.0;
+        size_t n_keep = q.size();
+        for (size_t k = 0; k < q.size(); ++k) {
+            cum += q[k].p/sum;
+            if (cum >= top_p) {
+                n_keep = k + 1;
+                break;
+            }
+        }
+        q.resize(n_keep);
+
+        sum = 0.0;
+        for (const auto & t : q) {
+            sum += t.p;
+        }
+        for (auto & t : q) {
+            t.p = (float) (t.p/sum);
+        }
+
+        std::uniform_real_distribution<double> unif(0.0, 1.0);
+        const double u = unif(rs_rng);
+        double run = 0.0;
+        for (const auto & t : q) {
+            run += t.p;
+            if (u < run) {
+                return t.id;
+            }
+        }
+        return q.back().id;
     }
 
     void accept(llama_seq_id seq_id, uint16_t n_accepted, bool /*is_other*/) override {
@@ -2853,6 +2914,15 @@ void common_speculative_draft(common_speculative * spec) {
                     if (!result.empty() && (int) result.size() > dp.n_max) {
                         SPC_DBG("truncating draft to %d tokens\n", dp.n_max);
                         result.resize(dp.n_max);
+                    }
+                }
+
+                // a drafter without draft distributions, or a draft cut above: keep result_q aligned or empty
+                if (dp.result_q) {
+                    if (impl->type != COMMON_SPECULATIVE_TYPE_DRAFT_MTP || dp.result_q->size() < result.size()) {
+                        dp.result_q->clear();
+                    } else {
+                        dp.result_q->resize(result.size());
                     }
                 }
 

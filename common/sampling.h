@@ -4,6 +4,7 @@
 
 #include "common.h"
 
+#include <random>
 #include <string>
 #include <vector>
 
@@ -87,6 +88,25 @@ std::vector<llama_token> common_sampler_sample_and_accept_n(struct common_sample
 
 // assume idxs == [ 0, 1, 2, ..., draft.size() ]
 std::vector<llama_token> common_sampler_sample_and_accept_n(struct common_sampler * gsmpl, struct llama_context * ctx, const llama_tokens & draft, bool grammar_first = false);
+
+// speculative sampling (Leviathan et al. 2023, Chen et al. 2023) for drafts that were sampled, not argmax:
+// draft[i] was drawn from draft_q[i] (token ids with probabilities that sum to 1). It is accepted with
+// probability min(1, p_i(x)/q_i(x)), where p_i is the target distribution after the full sampler chain;
+// on rejection a token is drawn from norm(max(0, p_i - q_i)) and verification stops. The emitted tokens
+// are distributed exactly as sampling the target alone, and are accepted into gsmpl as usual.
+// A position whose target probabilities are not available (backend sampling) falls back to matching.
+// requires: idxs.size() == draft.size() + 1, draft_q.size() == draft.size()
+std::vector<llama_token> common_sampler_sample_and_accept_n_rs(
+        struct common_sampler * gsmpl, struct llama_context * ctx, const std::vector<int> & idxs,
+        const llama_tokens & draft, const std::vector<std::vector<llama_token_data>> & draft_q,
+        std::mt19937 & rng, bool grammar_first = false);
+
+// one verification step of the above on explicit distributions, for tests: p and q are (id, p) lists
+// summing to 1, x was drawn from q, u_accept and u_resample are independent uniforms in [0, 1).
+// Returns x when accepted, otherwise the residual draw.
+llama_token common_speculative_rs_step(
+        const llama_token_data * p, size_t n_p, const llama_token_data * q, size_t n_q,
+        llama_token x, double u_accept, double u_resample, bool * accepted);
 
 uint32_t common_sampler_get_seed(const struct common_sampler * gsmpl);
 

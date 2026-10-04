@@ -97,6 +97,47 @@ static std::vector<llama_token> server_sample_and_accept_synth(
     return result;
 }
 
+// speculative sampling (common_sampler_sample_and_accept_n_rs) instead of matching, for sampled requests
+static bool server_spec_rs_enabled() {
+    static const bool enabled = [] {
+        const char * s = getenv("LLAMA_SPEC_RS");
+        return s != nullptr && atoi(s) != 0;
+    }();
+    return enabled;
+}
+
+// the drafter samples at the request temperature times this factor (LLAMA_SPEC_RS_TSCALE, default 1):
+// any draft distribution keeps the output exact, a sharper one trades tail overlap for top-token mass
+static float server_spec_rs_tscale() {
+    static const float scale = [] {
+        const char * s = getenv("LLAMA_SPEC_RS_TSCALE");
+        const float v = s ? (float) atof(s) : 1.0f;
+        return v > 0.0f ? v : 1.0f;
+    }();
+    return scale;
+}
+
+// after a context checkpoint restore, the replayed draft holds tokens that speculative sampling already
+// accepted: accept them as they are (re-sampling could disagree), then sample the next token
+static std::vector<llama_token> server_accept_replay(
+        common_sampler * smpl,
+        llama_context * ctx,
+        const std::vector<int32_t> & idxs,
+        const llama_tokens & draft) {
+    GGML_ASSERT(idxs.size() == draft.size() + 1);
+
+    std::vector<llama_token> result(draft.begin(), draft.end());
+    for (const llama_token id : draft) {
+        common_sampler_accept(smpl, id, true);
+    }
+
+    const llama_token id = common_sampler_sample(smpl, ctx, idxs[draft.size()]);
+    common_sampler_accept(smpl, id, true);
+    result.push_back(id);
+
+    return result;
+}
+
 // state diagram: https://github.com/ggml-org/llama.cpp/pull/9283
 enum slot_state {
     SLOT_STATE_IDLE,
@@ -259,6 +300,13 @@ struct server_slot {
     bool spec_is_replay = false;
     std::mt19937 spec_synth_rng;
 
+    // speculative sampling (LLAMA_SPEC_RS=1): the draft distribution of each sampled draft token,
+    // whether the last verification used it (a checkpoint replay must then repeat its decisions),
+    // and the uniforms of the accept/resample draws
+    std::vector<std::vector<llama_token_data>> spec_draft_q;
+    bool spec_rs_last = false;
+    std::mt19937 spec_rs_rng;
+
     // TODO: move members that belong to the task (such as `generated_text`, `has_new_line`) to task_results_state
     //       see https://github.com/ggml-org/llama.cpp/pull/18283#issuecomment-3710175837
     std::unique_ptr<const server_task> task;
@@ -382,6 +430,8 @@ struct server_slot {
 
         if (can_speculate()) {
             spec_draft.clear();
+            spec_draft_q.clear();
+            spec_rs_last = false;
             spec_i_batch.clear();
             spec_ckpt.clear();
         }
@@ -2138,6 +2188,13 @@ private:
                     : task.params.sampling.seed;
                 slot.spec_synth_rng.seed(seed);
             }
+
+            if (spec && server_spec_rs_enabled()) {
+                const uint32_t seed = task.params.sampling.seed == LLAMA_DEFAULT_SEED
+                    ? std::random_device{}()
+                    : task.params.sampling.seed;
+                slot.spec_rs_rng.seed(seed ^ 0x9e3779b9u);
+            }
         } else {
             slot.smpl.reset();
         }
@@ -3353,6 +3410,12 @@ private:
 
                         slot.spec_prompt = slot.prompt.tokens.get_text_tokens();
 
+                        // speculative sampling needs a sampled target: temp > 0 and the plain dist sampler
+                        const auto & sp = slot.task->params.sampling;
+                        const bool rs = server_spec_rs_enabled() && sp.temp > 0.0f && sp.mirostat == 0;
+
+                        slot.spec_draft_q.clear();
+
                         common_speculative_get_draft_params(spec.get(), slot.id) = {
                             /* .drafting = */ true,
                             /* .n_max    = */ n_draft_max,
@@ -3360,6 +3423,9 @@ private:
                             /* .id_last  = */ slot.sampled,
                             /* .prompt   = */ &slot.spec_prompt,
                             /* .result   = */ &slot.spec_draft,
+                            /* .temp     = */ rs ? sp.temp*server_spec_rs_tscale() : 0.0f,
+                            /* .top_p    = */ rs ? sp.top_p : 1.0f,
+                            /* .result_q = */ rs ? &slot.spec_draft_q : nullptr,
                         };
 
                         drafting.push_back(&slot);
@@ -4240,11 +4306,23 @@ private:
 
                 GGML_ASSERT(slot.spec_i_batch.size() == n_draft + 1);
                 const auto & synth_probs = common_speculative_get_synth_probs(spec.get());
-                auto accepted = synth_probs.empty()
-                    ? common_sampler_sample_and_accept_n(slot.smpl.get(), slot.ctx_tgt, slot.spec_i_batch, slot.spec_draft)
-                    : server_sample_and_accept_synth(
+                const bool rs_draft  = !slot.spec_draft_q.empty() && slot.spec_draft_q.size() == slot.spec_draft.size();
+                const bool rs_replay = slot.spec_is_replay && slot.spec_rs_last;
+                std::vector<llama_token> accepted;
+                if (!synth_probs.empty()) {
+                    accepted = server_sample_and_accept_synth(
                             slot.smpl.get(), slot.ctx_tgt, slot.spec_i_batch, slot.spec_draft,
                             synth_probs, slot.spec_synth_rng, slot.spec_is_replay);
+                } else if (rs_replay) {
+                    accepted = server_accept_replay(slot.smpl.get(), slot.ctx_tgt, slot.spec_i_batch, slot.spec_draft);
+                } else if (rs_draft) {
+                    accepted = common_sampler_sample_and_accept_n_rs(slot.smpl.get(), slot.ctx_tgt, slot.spec_i_batch,
+                            slot.spec_draft, slot.spec_draft_q, slot.spec_rs_rng);
+                } else {
+                    accepted = common_sampler_sample_and_accept_n(slot.smpl.get(), slot.ctx_tgt, slot.spec_i_batch, slot.spec_draft);
+                }
+                slot.spec_rs_last = rs_draft;
+                slot.spec_draft_q.clear();
                 slot.spec_i_batch.clear();
 
                 GGML_ASSERT(accepted.size() >= 1);

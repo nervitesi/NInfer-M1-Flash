@@ -69,6 +69,14 @@ struct common_speculative_draft_params {
 
     // the generated draft from the last _draft() call
     llama_tokens * result;
+
+    // sampled drafts for speculative sampling (common_sampler_sample_and_accept_n_rs): when temp > 0 and
+    // result_q is set, a drafter that supports it draws each token from its own distribution at this
+    // temperature and top-p, and stores that distribution in result_q, aligned with result.
+    // Other drafters leave result_q empty, and verification falls back to matching.
+    float temp  = 0.0f;
+    float top_p = 1.0f;
+    std::vector<std::vector<llama_token_data>> * result_q = nullptr;
 };
 
 common_speculative_draft_params & common_speculative_get_draft_params(common_speculative * spec, llama_seq_id seq_id);
