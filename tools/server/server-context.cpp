@@ -106,6 +106,15 @@ static bool server_spec_rs_enabled() {
     return enabled;
 }
 
+// LLAMA_SPEC_NGRAM_IN_REASONING=1: let the n-gram drafters run inside the reasoning block too
+static bool server_spec_ngram_in_reasoning() {
+    static const bool enabled = [] {
+        const char * s = getenv("LLAMA_SPEC_NGRAM_IN_REASONING");
+        return s != nullptr && atoi(s) != 0;
+    }();
+    return enabled;
+}
+
 // the drafter samples at the request temperature times this factor (LLAMA_SPEC_RS_TSCALE, default 1):
 // any draft distribution keeps the output exact, a sharper one trades tail overlap for top-token mass
 static float server_spec_rs_tscale() {
@@ -306,6 +315,55 @@ struct server_slot {
     std::vector<std::vector<llama_token_data>> spec_draft_q;
     bool spec_rs_last = false;
     std::mt19937 spec_rs_rng;
+
+    // n-gram drafts are held back while the model reasons (LLAMA_SPEC_NGRAM_IN_REASONING=1 allows them):
+    // reasoning text rarely repeats the context, so its 48-64 token drafts are mostly rejected. The state
+    // follows the thinking start/end tags of the chat template through the generation prompt and every
+    // generated token; requests without thinking tags never reason.
+    bool spec_in_reasoning = false;
+    llama_tokens spec_tag_tail;
+
+    void spec_reasoning_update(llama_token tok) {
+        const auto & sp = task->params.sampling;
+        if (sp.reasoning_budget_end.empty()) {
+            return;
+        }
+        size_t n_tail = sp.reasoning_budget_start.size();
+        for (const auto & end : sp.reasoning_budget_end) {
+            n_tail = std::max(n_tail, end.size());
+        }
+        spec_tag_tail.push_back(tok);
+        if (spec_tag_tail.size() > n_tail) {
+            spec_tag_tail.erase(spec_tag_tail.begin(), spec_tag_tail.end() - n_tail);
+        }
+        auto ends_with = [&](const llama_tokens & tag) {
+            return !tag.empty() && spec_tag_tail.size() >= tag.size() &&
+                std::equal(tag.begin(), tag.end(), spec_tag_tail.end() - tag.size());
+        };
+        if (ends_with(sp.reasoning_budget_start)) {
+            spec_in_reasoning = true;
+        }
+        for (const auto & end : sp.reasoning_budget_end) {
+            if (ends_with(end)) {
+                if (spec_in_reasoning && stats.n_gen > 0) {
+                    SLT_INF(*this, "reasoning ended after %d tokens, n-gram drafts enabled\n", (int) stats.n_gen);
+                }
+                spec_in_reasoning = false;
+            }
+        }
+    }
+
+    void spec_reasoning_begin(const llama_vocab * vocab) {
+        spec_in_reasoning = false;
+        spec_tag_tail.clear();
+        const auto & gp = task->params.sampling.generation_prompt;
+        if (gp.empty() || task->params.sampling.reasoning_budget_end.empty()) {
+            return;
+        }
+        for (const llama_token tok : common_tokenize(vocab, gp, false, true)) {
+            spec_reasoning_update(tok);
+        }
+    }
 
     // TODO: move members that belong to the task (such as `generated_text`, `has_new_line`) to task_results_state
     //       see https://github.com/ggml-org/llama.cpp/pull/18283#issuecomment-3710175837
@@ -2204,6 +2262,8 @@ private:
 
         slot.task = std::make_unique<const server_task>(std::move(task));
 
+        slot.spec_reasoning_begin(vocab);
+
         slot.state = slot.task->is_child()
             ? SLOT_STATE_WAIT_OTHER // wait for the parent to process prompt
             : SLOT_STATE_STARTED;
@@ -2219,6 +2279,8 @@ private:
         // remember which tokens were sampled - used for repetition penalties during sampling
         const std::string token_str = result.text_to_send;
         slot.sampled = result.tok;
+
+        slot.spec_reasoning_update(result.tok);
 
         slot.generated_text += token_str;
         if (slot.task->params.return_tokens) {
@@ -3426,6 +3488,7 @@ private:
                             /* .temp     = */ rs ? sp.temp*server_spec_rs_tscale() : 0.0f,
                             /* .top_p    = */ rs ? sp.top_p : 1.0f,
                             /* .result_q = */ rs ? &slot.spec_draft_q : nullptr,
+                            /* .allow_ngram = */ !slot.spec_in_reasoning || server_spec_ngram_in_reasoning(),
                         };
 
                         drafting.push_back(&slot);

@@ -2865,6 +2865,19 @@ bool common_speculative_process(common_speculative * spec, const llama_batch & b
     return result;
 }
 
+static bool common_speculative_type_is_ngram(common_speculative_type type) {
+    switch (type) {
+        case COMMON_SPECULATIVE_TYPE_NGRAM_SIMPLE:
+        case COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K:
+        case COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K4V:
+        case COMMON_SPECULATIVE_TYPE_NGRAM_MOD:
+        case COMMON_SPECULATIVE_TYPE_NGRAM_CACHE:
+            return true;
+        default:
+            return false;
+    }
+}
+
 void common_speculative_draft(common_speculative * spec) {
     if (spec == nullptr) {
         return;
@@ -2889,10 +2902,25 @@ void common_speculative_draft(common_speculative * spec) {
     }
 
     for (auto & impl : spec->impls) {
+        // sequences that hold back the n-gram drafters skip this implementation and stay open for the next
+        std::vector<llama_seq_id> held;
+        if (common_speculative_type_is_ngram(impl->type)) {
+            for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) dparams.size(); ++seq_id) {
+                if (dparams[seq_id].drafting && !dparams[seq_id].allow_ngram) {
+                    dparams[seq_id].drafting = false;
+                    held.push_back(seq_id);
+                }
+            }
+        }
+
         {
             common_time_meas tm(impl->t_draft_us, !impl->gen_perf);
             impl->draft(dparams);
             impl->n_call_draft++;
+        }
+
+        for (const llama_seq_id seq_id : held) {
+            dparams[seq_id].drafting = true;
         }
 
         int n_drafting = 0;

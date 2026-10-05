@@ -77,6 +77,10 @@ struct common_speculative_draft_params {
     float temp  = 0.0f;
     float top_p = 1.0f;
     std::vector<std::vector<llama_token_data>> * result_q = nullptr;
+
+    // false holds back the n-gram drafters for this sequence (e.g. while the model is reasoning);
+    // the model-based drafters still run
+    bool allow_ngram = true;
 };
 
 common_speculative_draft_params & common_speculative_get_draft_params(common_speculative * spec, llama_seq_id seq_id);
