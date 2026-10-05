@@ -2550,13 +2550,27 @@ int ggml_metal_op_mul_mat(ggml_metal_op_t ctx, int idx) {
 
     const bool m1 = ggml_metal_m1_tuning(props_dev);
 
-    // M1: IQ4_NL rows of 64*k values (the 320-wide hyper-connection up projections) with 4
-    // threads per row: 45-55% faster than the per-token kernel with 2-8 tokens
-    const bool ext_k64 = m1 && op->src[0]->type == GGML_TYPE_IQ4_NL && ne00%64 == 0;
+    // GGML_METAL_M1_HC=0 turns off the Q8_0 and few-long-rows rules below (A/B runs)
+    static const bool m1_hc = [] { const char * s = getenv("GGML_METAL_M1_HC"); return !s || atoi(s) != 0; }();
+
+    // M1: IQ4_NL and Q8_0 rows of 64*k values (the 320-wide hyper-connection up projections) with 4
+    // threads per row and 4 simdgroups: vs the per-token kernel with 2-4 tokens, 45-55% faster for IQ4_NL, 4-6x for Q8_0
+    const bool ext_k64 = m1 && ne00%64 == 0 &&
+        (op->src[0]->type == GGML_TYPE_IQ4_NL || (m1_hc && op->src[0]->type == GGML_TYPE_Q8_0 && ne00%128 != 0));
+
+    // M1: few long rows (the hyper-connection down projections, 320-324 rows of 10240 values) give the
+    // small-batch kernel too few threadgroups. With 2-4 tokens IQ4_NL is 10-60% faster on the per-token
+    // kernel; Q8_0 runs 2.5x faster with 32 threads per row (16 and 2 tokens per threadgroup at 4 tokens)
+    const bool few_long = m1 && m1_hc && ne00 >= 4096 && ne00%512 == 0 && ne01 <= 1024;
+
+    // experiment knobs: GGML_METAL_EXT_IQ4XS_ALL=1 sends every IQ4_XS shape with 2-8 tokens to the small-batch kernel,
+    // GGML_METAL_EXT_OFF=1 keeps all shapes on the per-token kernel
+    static const bool env_iq4xs_all = [] { const char * s = getenv("GGML_METAL_EXT_IQ4XS_ALL"); return s && atoi(s) != 0; }();
+    static const bool env_ext_off   = [] { const char * s = getenv("GGML_METAL_EXT_OFF");       return s && atoi(s) != 0; }();
 
     // first try to use small-batch mat-mv kernels
     // these should be efficient for BS [2, ~8]
-    if (op->src[1]->type == GGML_TYPE_F32 && (ne00%128 == 0 || ext_k64) &&
+    if (!env_ext_off && op->src[1]->type == GGML_TYPE_F32 && (ne00%128 == 0 || ext_k64) &&
         (
          (
           (
@@ -2571,7 +2585,7 @@ int ggml_metal_op_mul_mat(ggml_metal_op_t ctx, int idx) {
            op->src[0]->type == GGML_TYPE_Q5_1 ||
            op->src[0]->type == GGML_TYPE_Q8_0 ||
            op->src[0]->type == GGML_TYPE_MXFP4 ||
-           op->src[0]->type == GGML_TYPE_IQ4_NL ||
+           (op->src[0]->type == GGML_TYPE_IQ4_NL && !few_long) ||
            false) && (ne11 >= 2 && ne11 <= 8)
          ) ||
          (
@@ -2579,6 +2593,9 @@ int ggml_metal_op_mul_mat(ggml_metal_op_t ctx, int idx) {
           // 11-40% faster with 3-8 tokens on tall matrices (6240-12288 rows) and on 2560 rows
           // of 6144 values; 3x slower on 324 rows of 10240 values, slower with 2 tokens
           m1 && op->src[0]->type == GGML_TYPE_IQ4_XS && (ne01 >= 4096 || (ne00 >= 4096 && ne01 >= 2048)) && (ne11 >= 3 && ne11 <= 8)
+         ) ||
+         (
+          m1 && env_iq4xs_all && op->src[0]->type == GGML_TYPE_IQ4_XS && (ne11 >= 2 && ne11 <= 8)
          ) ||
          (
           (
@@ -2621,6 +2638,25 @@ int ggml_metal_op_mul_mat(ggml_metal_op_t ctx, int idx) {
         if (m1 && op->src[0]->type == GGML_TYPE_IQ4_NL) {
             nsg = (ne11 >= 4 || ext_k64) ? 4 : 2;
         }
+        if (ext_k64) {
+            nsg = 4;
+        }
+        const bool q8_few_long = few_long && op->src[0]->type == GGML_TYPE_Q8_0 && ne11 <= 4;
+        if (q8_few_long) {
+            nxpsg = ne11 <= 3 ? 32 : 16;
+        }
+
+        // experiment knobs: GGML_METAL_EXT_NSG / _NXPSG / _R1MAX override the choice above when valid
+        {
+            static const int env_nsg   = [] { const char * s = getenv("GGML_METAL_EXT_NSG");   return s ? atoi(s) : 0; }();
+            static const int env_nxpsg = [] { const char * s = getenv("GGML_METAL_EXT_NXPSG"); return s ? atoi(s) : 0; }();
+            if (env_nsg == 1 || env_nsg == 2 || env_nsg == 4 || env_nsg == 8) {
+                nsg = env_nsg;
+            }
+            if ((env_nxpsg == 4 || env_nxpsg == 8 || env_nxpsg == 16 || env_nxpsg == 32) && ne00 % (16*env_nxpsg) == 0) {
+                nxpsg = env_nxpsg;
+            }
+        }
 
         const int16_t nypsg  = 32/nxpsg;          // num threads along col per simdgroup (i.e. a simdgroup processes that many src0 rows at a time)
         const int16_t r0ptg  = nypsg*nsg;         // num src0 rows per threadgroup
@@ -2642,6 +2678,17 @@ int ggml_metal_op_mul_mat(ggml_metal_op_t ctx, int idx) {
             default:
                 GGML_ABORT("unsupported ne11");
         };
+
+        if (q8_few_long && ne11 == 4) {
+            r1ptg = 2;
+        }
+
+        {
+            static const int env_r1max = [] { const char * s = getenv("GGML_METAL_EXT_R1MAX"); return s ? atoi(s) : 0; }();
+            if (env_r1max >= 2 && r1ptg > env_r1max) {
+                r1ptg = env_r1max;
+            }
+        }
 
         auto pipeline = ggml_metal_library_get_pipeline_mul_mv_ext(lib, op, nsg, nxpsg, r1ptg);
 
