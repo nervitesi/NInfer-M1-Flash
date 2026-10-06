@@ -34,6 +34,9 @@ ggml_metal_op_t ggml_metal_op_init_mtl4(
 
 void ggml_metal_op_free(ggml_metal_op_t ctx);
 
+// Metal 4: commit what is encoded so far, so the GPU starts while the rest is encoded
+void ggml_metal_op_mtl4_flush(ggml_metal_op_t ctx);
+
 // command buffer the encoding ended in, and how many host ops split it (see ggml_metal_device_encode_host_op)
 ggml_metal_cmd_buf_t ggml_metal_op_cmd_buf(ggml_metal_op_t ctx);
 int                  ggml_metal_op_n_host_split(ggml_metal_op_t ctx);

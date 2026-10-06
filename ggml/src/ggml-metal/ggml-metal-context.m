@@ -82,6 +82,8 @@ struct ggml_metal {
     // the CPU waits for the context's pending work on the other
     int      m4_mode;
     uint64_t m4_last; // completion value of the last Metal 4 graph, 0 when none is pending
+    int      m4_flush_first; // nodes in the first command buffer of a Metal 4 graph (GGML_METAL4_FLUSH_FIRST, 0 = no split)
+    int      m4_flush_parts; // the rest is split in about this many command buffers (GGML_METAL4_FLUSH_PARTS)
 
     // abort ggml_metal_graph_compute if callback returns true
     ggml_abort_callback abort_callback;
@@ -168,6 +170,8 @@ ggml_metal_t ggml_metal_init(ggml_metal_device_t dev) {
 
         res->m4_mode = 0;
         res->m4_last = 0;
+        res->m4_flush_first = getenv("GGML_METAL4_FLUSH_FIRST") ? atoi(getenv("GGML_METAL4_FLUSH_FIRST")) : 64;
+        res->m4_flush_parts = getenv("GGML_METAL4_FLUSH_PARTS") ? atoi(getenv("GGML_METAL4_FLUSH_PARTS")) : 4;
         {
             const char * val = getenv("GGML_METAL4");
             if (val && atoi(val) > 0) {
@@ -553,13 +557,24 @@ static enum ggml_status ggml_metal_graph_compute_mtl4(ggml_metal_t ctx, struct g
             ctx->use_concurrency,
             ctx->debug_graph);
 
-        for (int idx = 0; idx < ggml_metal_op_n_nodes(ctx_op); ++idx) {
+        // one thread encodes the graph: commit a first small chunk right away and then a few larger ones, so the GPU
+        // runs while the rest is encoded (the classic path gets the same overlap from its parallel command buffers)
+        const int n_nodes = ggml_metal_op_n_nodes(ctx_op);
+        int next_flush = ctx->m4_flush_first > 0 ? ctx->m4_flush_first : n_nodes;
+        const int flush_step = ctx->m4_flush_parts > 0 ? MAX(64, n_nodes/ctx->m4_flush_parts) : n_nodes;
+
+        for (int idx = 0; idx < n_nodes; ++idx) {
             const int res = ggml_metal_op_encode(ctx_op, idx);
             if (res == 0) {
                 break;
             }
 
             idx += res - 1;
+
+            if (idx + 1 >= next_flush && idx + 1 < n_nodes) {
+                ggml_metal_op_mtl4_flush(ctx_op);
+                next_flush = idx + 1 + flush_step;
+            }
         }
 
         ggml_metal_op_free(ctx_op);

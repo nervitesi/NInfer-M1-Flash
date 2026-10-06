@@ -186,6 +186,16 @@ void ggml_metal_op_free(ggml_metal_op_t ctx) {
     delete ctx;
 }
 
+void ggml_metal_op_mtl4_flush(ggml_metal_op_t ctx) {
+    GGML_ASSERT(ctx->m4);
+
+    // the next command buffer starts after everything before it: no pending concurrency left
+    ctx->enc = ggml_metal_mtl4_flush(ctx->m4);
+    if (ctx->mem_ranges) {
+        ggml_mem_ranges_reset(ctx->mem_ranges);
+    }
+}
+
 ggml_metal_cmd_buf_t ggml_metal_op_cmd_buf(ggml_metal_op_t ctx) {
     return ctx->cmd_buf;
 }

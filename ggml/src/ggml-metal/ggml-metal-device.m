@@ -1802,6 +1802,11 @@ struct ggml_metal_mtl4 {
     int                   cb_alloc;
 
     struct ggml_metal_encoder * enc;
+
+    // allocators of command buffers committed without a signal (ggml_metal_mtl4_flush): free once the next signaled
+    // value is reached, which the queue order guarantees comes after them
+    int pending_alloc[GGML_METAL4_N_ALLOC];
+    int n_pending;
 };
 
 bool ggml_metal_device_supports_mtl4(ggml_metal_device_t dev) {
@@ -1931,8 +1936,8 @@ static void ggml_metal_mtl4_begin_cb(struct ggml_metal_mtl4 * m4) {
     m4->enc->m4   = m4;
 }
 
-// end the current command buffer, commit it and signal `value` on the queue once it is done
-static void ggml_metal_mtl4_commit_cb(struct ggml_metal_mtl4 * m4, uint64_t value) {
+// end the current command buffer and commit it
+static void ggml_metal_mtl4_submit_cb(struct ggml_metal_mtl4 * m4) {
     ggml_metal_device_t dev = m4->dev;
 
     [m4->enc->obj4 endEncoding];
@@ -1943,14 +1948,25 @@ static void ggml_metal_mtl4_commit_cb(struct ggml_metal_mtl4 * m4, uint64_t valu
 
     id<MTL4CommandBuffer> cb = m4->cb;
     [(id<MTL4CommandQueue>) dev->q4 commit:&cb count:1 options:dev->m4_opts];
+
+    [m4->cb release];
+    m4->cb = nil;
+}
+
+// end the current command buffer, commit it and signal `value` on the queue once it is done
+static void ggml_metal_mtl4_commit_cb(struct ggml_metal_mtl4 * m4, uint64_t value) {
+    ggml_metal_device_t dev = m4->dev;
+
+    ggml_metal_mtl4_submit_cb(m4);
     [(id<MTL4CommandQueue>) dev->q4 signalEvent:dev->host_event value:value];
 
     [dev->m4_lock lock];
     dev->m4_alloc_value[m4->cb_alloc] = value;
+    for (int i = 0; i < m4->n_pending; ++i) {
+        dev->m4_alloc_value[m4->pending_alloc[i]] = value;
+    }
+    m4->n_pending = 0;
     [dev->m4_lock unlock];
-
-    [m4->cb release];
-    m4->cb = nil;
 }
 
 ggml_metal_mtl4_t ggml_metal_mtl4_begin(ggml_metal_device_t dev, bool serial) {
@@ -2015,6 +2031,24 @@ ggml_metal_encoder_t ggml_metal_mtl4_host_op(ggml_metal_mtl4_t m4, struct ggml_t
 
     ggml_metal_mtl4_commit_cb(m4, v);
     [(id<MTL4CommandQueue>) dev->q4 waitForEvent:event value:v + 1];
+    ggml_metal_mtl4_begin_cb(m4);
+
+    return m4->enc;
+}
+
+ggml_metal_encoder_t ggml_metal_mtl4_flush(ggml_metal_mtl4_t m4) {
+    ggml_metal_device_t dev = m4->dev;
+
+    const int a = m4->cb_alloc;
+    GGML_ASSERT(m4->n_pending < GGML_METAL4_N_ALLOC/2);
+
+    // busy until the next signaled value (set by ggml_metal_mtl4_commit_cb)
+    [dev->m4_lock lock];
+    dev->m4_alloc_value[a] = UINT64_MAX;
+    [dev->m4_lock unlock];
+    m4->pending_alloc[m4->n_pending++] = a;
+
+    ggml_metal_mtl4_submit_cb(m4);
     ggml_metal_mtl4_begin_cb(m4);
 
     return m4->enc;
