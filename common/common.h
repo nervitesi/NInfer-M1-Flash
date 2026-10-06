@@ -585,7 +585,7 @@ struct common_params {
 
     // MoE expert streaming: routed experts stay on disk, read on demand into a cache of expert slots
     bool     moe_stream            = false; // stream routed expert weights from disk
-    bool     moe_stream_direct     = false; // F_NOCACHE/O_DIRECT expert reads
+    bool     moe_stream_direct     = true;  // F_NOCACHE/O_DIRECT expert reads (--moe-stream-buffered turns them off)
     uint64_t moe_stream_budget     = 0;     // expert cache size in bytes (used when moe_stream_slots is 0)
     uint32_t moe_stream_slots      = 0;     // expert cache slots per layer (0 = from the budget)
     int32_t  moe_stream_io_threads = 0;     // I/O threads for expert reads (<= 0 = default)

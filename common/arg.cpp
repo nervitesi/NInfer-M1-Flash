@@ -2480,12 +2480,21 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     ).set_env("LLAMA_ARG_MOE_STREAM_IO_THREADS"));
     add_opt(common_arg(
         {"--moe-stream-direct"},
-        "read the streamed experts with F_NOCACHE/O_DIRECT, bypassing the page cache; implies --moe-stream",
+        "read the streamed experts with F_NOCACHE/O_DIRECT, bypassing the page cache (default); implies --moe-stream",
         [](common_params & params) {
             params.moe_stream_direct = true;
             params.moe_stream = true;
         }
     ).set_env("LLAMA_ARG_MOE_STREAM_DIRECT"));
+    add_opt(common_arg(
+        {"--moe-stream-buffered"},
+        "read the streamed experts through the page cache instead (it then holds a second copy of every expert "
+        "read, ~32 GiB on the true Q4 against ~11 GiB direct, at the same speed); implies --moe-stream",
+        [](common_params & params) {
+            params.moe_stream_direct = false;
+            params.moe_stream = true;
+        }
+    ).set_env("LLAMA_ARG_MOE_STREAM_BUFFERED"));
     add_opt(common_arg(
         {"-ctk", "--cache-type-k"}, "TYPE",
         string_format(
