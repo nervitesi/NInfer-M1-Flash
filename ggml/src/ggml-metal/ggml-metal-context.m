@@ -85,6 +85,21 @@ struct ggml_metal {
     int      m4_flush_first; // nodes in the first command buffer of a Metal 4 graph (GGML_METAL4_FLUSH_FIRST, 0 = no split)
     int      m4_flush_parts; // the rest is split in about this many command buffers (GGML_METAL4_FLUSH_PARTS)
 
+    // A Metal 4 queue-level waitForEvent stops holding back the work committed after it once it has waited behind a few
+    // seconds of GPU work (M1 Max, macOS 26; tools/metal-sync-bench/mtl4waitcheck.m): a whole prompt-processing graph
+    // committed at once let the GPU run past host ops that were still loading experts. A graph with host ops is
+    // committed upfront only when the same graph took less than m4_max_ms the last time (decode, short verifies);
+    // otherwise each part after a host op is committed when the GPU reaches the op (jit, see ggml_metal_mtl4_begin).
+    // The classic queue is no way out for those: it kills command buffers that run for more than a few seconds.
+    int m4_max_ms; // GGML_METAL4_MAX_MS, default 250; negative = always upfront (unsafe), 0 = always jit
+    struct {
+        uint64_t sig;
+        float    ms;
+    } m4_times[16];  // last duration of recent graphs, by shape signature
+    int      m4_times_next;
+    uint64_t time_sig; // signature and start of the graph whose completion is not timed yet, 0 = none
+    int64_t  time_t0;
+
     // abort ggml_metal_graph_compute if callback returns true
     ggml_abort_callback abort_callback;
     void *              abort_callback_data;
@@ -172,6 +187,7 @@ ggml_metal_t ggml_metal_init(ggml_metal_device_t dev) {
         res->m4_last = 0;
         res->m4_flush_first = getenv("GGML_METAL4_FLUSH_FIRST") ? atoi(getenv("GGML_METAL4_FLUSH_FIRST")) : 64;
         res->m4_flush_parts = getenv("GGML_METAL4_FLUSH_PARTS") ? atoi(getenv("GGML_METAL4_FLUSH_PARTS")) : 4;
+        res->m4_max_ms      = getenv("GGML_METAL4_MAX_MS")      ? atoi(getenv("GGML_METAL4_MAX_MS"))      : 250;
         {
             const char * val = getenv("GGML_METAL4");
             if (val && atoi(val) > 0) {
@@ -187,6 +203,9 @@ ggml_metal_t ggml_metal_init(ggml_metal_device_t dev) {
         GGML_LOG_INFO("%s: use concurrency    = %s\n", __func__, res->use_concurrency    ? "true" : "false");
         GGML_LOG_INFO("%s: use graph optimize = %s\n", __func__, res->use_graph_optimize ? "true" : "false");
         GGML_LOG_INFO("%s: use Metal 4        = %s\n", __func__, res->m4_mode == 2 ? "all graphs" : res->m4_mode == 1 ? "graphs with host ops" : "false");
+        if (res->m4_mode > 0) {
+            GGML_LOG_INFO("%s: Metal 4 host-op graphs committed upfront up to %d ms, longer ones part by part\n", __func__, res->m4_max_ms);
+        }
 
         res->capture_compute = 0;
         res->capture_started = false;
@@ -286,6 +305,41 @@ const char * ggml_metal_get_name(ggml_metal_t ctx) {
     return ctx->name;
 }
 
+// the last time a graph with this signature completed, it took less than m4_max_ms
+static bool ggml_metal_graph_was_short(ggml_metal_t ctx, uint64_t sig) {
+    if (ctx->m4_max_ms <= 0) {
+        return ctx->m4_max_ms < 0;
+    }
+    for (int i = 0; i < (int) (sizeof(ctx->m4_times)/sizeof(ctx->m4_times[0])); ++i) {
+        if (ctx->m4_times[i].sig == sig) {
+            return ctx->m4_times[i].ms < ctx->m4_max_ms;
+        }
+    }
+    return false;
+}
+
+static void ggml_metal_graph_time_done(ggml_metal_t ctx) {
+    if (ctx->time_sig == 0) {
+        return;
+    }
+    const float ms = (ggml_time_us() - ctx->time_t0)/1000.0f;
+    const int n = (int) (sizeof(ctx->m4_times)/sizeof(ctx->m4_times[0]));
+    int slot = -1;
+    for (int i = 0; i < n; ++i) {
+        if (ctx->m4_times[i].sig == ctx->time_sig) {
+            slot = i;
+            break;
+        }
+    }
+    if (slot < 0) {
+        slot = ctx->m4_times_next;
+        ctx->m4_times_next = (ctx->m4_times_next + 1) % n;
+    }
+    ctx->m4_times[slot].sig = ctx->time_sig;
+    ctx->m4_times[slot].ms  = ms;
+    ctx->time_sig = 0;
+}
+
 void ggml_metal_synchronize(ggml_metal_t ctx) {
     if (ctx->m4_last > 0) {
         ggml_metal_wait_mtl4(ctx);
@@ -303,6 +357,8 @@ void ggml_metal_synchronize(ggml_metal_t ctx) {
         [ctx->cmd_buf_last waitUntilCompleted];
         ctx->cmd_buf_last = nil;
     }
+
+    ggml_metal_graph_time_done(ctx);
 
     // check status of all command buffers
     {
@@ -534,7 +590,7 @@ bool ggml_metal_cpy_tensor_async(ggml_metal_t ctx_src, ggml_metal_t ctx_dst, con
 }
 
 // the whole graph on the Metal 4 queue, encoded by the calling thread; host ops split it into several command buffers
-static enum ggml_status ggml_metal_graph_compute_mtl4(ggml_metal_t ctx, struct ggml_cgraph * gf) {
+static enum ggml_status ggml_metal_graph_compute_mtl4(ggml_metal_t ctx, struct ggml_cgraph * gf, bool jit) {
     if (ctx->cmd_buf_last) {
         [ctx->cmd_buf_last waitUntilCompleted];
         ctx->cmd_buf_last = nil;
@@ -545,7 +601,7 @@ static enum ggml_status ggml_metal_graph_compute_mtl4(ggml_metal_t ctx, struct g
     }
 
     @autoreleasepool {
-        ggml_metal_mtl4_t m4 = ggml_metal_mtl4_begin(ctx->dev, !ctx->use_concurrency);
+        ggml_metal_mtl4_t m4 = ggml_metal_mtl4_begin(ctx->dev, !ctx->use_concurrency, jit);
 
         ggml_metal_op_t ctx_op = ggml_metal_op_init_mtl4(
             ctx->dev,
@@ -606,14 +662,24 @@ enum ggml_status ggml_metal_graph_compute(ggml_metal_t ctx, struct ggml_cgraph *
     // keep the memory wired
     ggml_metal_device_rsets_keep_alive(ctx->dev);
 
+    // the signature tells graphs of different shapes apart (ubatch size, KV length), so a decode graph is not taken for
+    // the prompt graph before it
     int n_host = 0;
+    uint64_t sig = 1469598103934665603ull;
     for (int i = 0; i < gf->n_nodes; ++i) {
         n_host += ggml_metal_host_op_is_registered(gf->nodes[i]);
+        sig = (sig ^ (uint64_t) (ggml_nelements(gf->nodes[i])*GGML_OP_COUNT + gf->nodes[i]->op)) * 1099511628211ull;
     }
+    sig = sig ? sig : 1;
     ctx->has_host_ops = n_host > 0;
 
+    // a graph whose completion was never waited for is not timed
+    ctx->time_sig = sig;
+    ctx->time_t0  = ggml_time_us();
+
     if ((ctx->m4_mode == 2 || (ctx->m4_mode == 1 && n_host > 0)) && ctx->capture_compute != 1) {
-        return ggml_metal_graph_compute_mtl4(ctx, gf);
+        // long or new graph with host ops: part by part, see m4_max_ms
+        return ggml_metal_graph_compute_mtl4(ctx, gf, n_host > 0 && !ggml_metal_graph_was_short(ctx, sig));
     }
 
     ggml_metal_wait_mtl4(ctx);

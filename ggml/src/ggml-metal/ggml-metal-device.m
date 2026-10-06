@@ -1016,6 +1016,12 @@ struct ggml_metal_device {
     int      m4_slot_next;
     id       m4_rset;           // every ggml buffer and the constants buffers, attached to q4 (under rsets->lock)
     atomic_bool m4_error;
+
+    // Metal 4 command buffers not committed yet, in queue order (see ggml_metal_mtl4_pump)
+    pthread_mutex_t m4_commit_mtx;
+    struct ggml_metal_mtl4_item * m4_items; // ring of GGML_METAL4_N_ALLOC: every queued buffer holds an allocator
+    int m4_items_head;
+    int m4_items_count;
 };
 
 //
@@ -1226,6 +1232,7 @@ ggml_metal_device_t ggml_metal_device_init(int device, int n_devices) {
                 dev->host_event = [dev->mtl_device newSharedEvent];
                 dev->m4_lock = [[NSLock alloc] init];
                 dev->m4_graph_lock = [[NSLock alloc] init];
+                pthread_mutex_init(&dev->m4_commit_mtx, NULL);
                 dev->host_listener = [[MTLSharedEventListener alloc] initWithDispatchQueue:
                     dispatch_queue_create("ggml-metal-host-op", DISPATCH_QUEUE_SERIAL)];
                 atomic_store(&dev->host_value, 0);
@@ -1506,6 +1513,15 @@ struct ggml_metal_host_spin {
 
 static void ggml_metal_host_op_run(struct ggml_tensor * node);
 
+// Nothing the GPU signals can go past value v before the reply v + 1, unless it skipped the wait for it (a Metal 4 queue
+// wait behind too much GPU work, see m4_max_ms in ggml-metal-context.m). The graph then ran on data the host op had not
+// written yet: fail it loudly instead of returning wrong results. Returns false when the op should not run: from then on
+// the ops only reply, so the failing graph drains without tripping over the inputs it corrupted.
+static bool ggml_metal_host_op_check_order(ggml_metal_device_t dev, id<MTLSharedEvent> event, uint64_t v, const char * name);
+
+// Metal 4 command buffers queued behind a host op are committed once the GPU reaches it (jit mode)
+static void ggml_metal_mtl4_pump(ggml_metal_device_t dev);
+
 static void * ggml_metal_host_spin_main(void * arg) {
     struct ggml_metal_host_spin * hs = (struct ggml_metal_host_spin *) arg;
     id<MTLSharedEvent> event = hs->dev->host_event;
@@ -1544,7 +1560,10 @@ static void * ggml_metal_host_spin_main(void * arg) {
         }
 
         if (ready) {
-            ggml_metal_host_op_run(&snap[0]);
+            ggml_metal_mtl4_pump(hs->dev); // the buffers after this op, in jit mode: committed while it runs
+            if (ggml_metal_host_op_check_order(hs->dev, event, v, snap[0].name)) {
+                ggml_metal_host_op_run(&snap[0]);
+            }
             event.signaledValue = v + 1;
         }
         free(snap);
@@ -1650,6 +1669,8 @@ void ggml_metal_device_free(ggml_metal_device_t dev) {
         }
         [dev->m4_lock release];
         [dev->m4_graph_lock release];
+        pthread_mutex_destroy(&dev->m4_commit_mtx);
+        free(dev->m4_items);
 
         ggml_metal_host_spin_free(dev);
 
@@ -1902,7 +1923,10 @@ ggml_metal_cmd_buf_t ggml_metal_device_encode_host_op(ggml_metal_device_t dev, g
     if (!ggml_metal_host_spin_submit(dev, v, snap)) {
         [event notifyListener:dev->host_listener atValue:v block:^(id<MTLSharedEvent> e, uint64_t value) {
             GGML_UNUSED(value);
-            ggml_metal_host_op_run(&snap[0]);
+            ggml_metal_mtl4_pump(dev);
+            if (ggml_metal_host_op_check_order(dev, e, v, snap[0].name)) {
+                ggml_metal_host_op_run(&snap[0]);
+            }
             free(snap);
             e.signaledValue = v + 1;
         }];
@@ -1955,6 +1979,23 @@ struct ggml_metal_mtl4 {
     // value is reached, which the queue order guarantees comes after them
     int pending_alloc[GGML_METAL4_N_ALLOC];
     int n_pending;
+
+    // A queue-level waitForEvent stops holding back the work committed after it once it has sat behind a few seconds of
+    // GPU work (M1 Max, macOS 26, tools/metal-sync-bench/mtl4waitcheck.m): with a whole prompt graph committed upfront
+    // the GPU ran past host ops still loading experts. In jit mode the command buffers after a host op are committed
+    // only once the GPU has reached it, so no wait is ever queued behind running work; short graphs (decode) commit
+    // everything upfront.
+    bool     jit;
+    uint64_t wait_next; // queue wait for the next command buffer: the reply of the host op before it, 0 = none
+    uint64_t gate;      // value the GPU signals at the last host op: in jit mode, the next buffers wait for it
+};
+
+// a command buffer waiting to be committed, with the queue wait before it and the signal after it
+struct ggml_metal_mtl4_item {
+    id<MTL4CommandBuffer> cb;
+    uint64_t wait;   // 0 = none
+    uint64_t signal; // 0 = none
+    uint64_t after;  // committed once host_event reaches it, 0 = right away
 };
 
 bool ggml_metal_device_supports_mtl4(ggml_metal_device_t dev) {
@@ -1964,7 +2005,53 @@ bool ggml_metal_device_supports_mtl4(ggml_metal_device_t dev) {
     return false;
 }
 
+// commit the queued command buffers whose gate the GPU has reached, in order; called by the encoding thread after
+// queueing, by the host-op thread when the GPU reaches a host op (before the op runs, so the commit overlaps it) and by
+// the CPU waits. After an error everything goes, so the waits drain.
+static void ggml_metal_mtl4_pump(ggml_metal_device_t dev) {
+    if (dev->q4 == nil) {
+        return;
+    }
+    pthread_mutex_lock(&dev->m4_commit_mtx);
+    while (dev->m4_items_count > 0) {
+        struct ggml_metal_mtl4_item * it = &dev->m4_items[dev->m4_items_head];
+        if (it->after > 0 && dev->host_event.signaledValue < it->after && !atomic_load(&dev->m4_error)) {
+            break;
+        }
+        id<MTL4CommandQueue> q = (id<MTL4CommandQueue>) dev->q4;
+        if (it->wait > 0) {
+            [q waitForEvent:dev->host_event value:it->wait];
+        }
+        id<MTL4CommandBuffer> cb = it->cb;
+        [q commit:&cb count:1 options:dev->m4_opts];
+        if (it->signal > 0) {
+            [q signalEvent:dev->host_event value:it->signal];
+        }
+        [it->cb release];
+        it->cb = nil;
+        dev->m4_items_head = (dev->m4_items_head + 1) % GGML_METAL4_N_ALLOC;
+        dev->m4_items_count--;
+    }
+    pthread_mutex_unlock(&dev->m4_commit_mtx);
+}
+
+static void ggml_metal_mtl4_enqueue(ggml_metal_device_t dev, id<MTL4CommandBuffer> cb, uint64_t wait, uint64_t signal, uint64_t after) {
+    pthread_mutex_lock(&dev->m4_commit_mtx);
+    // a queued buffer holds its allocator, and an allocator is reused only after its buffer completed
+    GGML_ASSERT(dev->m4_items_count < GGML_METAL4_N_ALLOC);
+    struct ggml_metal_mtl4_item * it = &dev->m4_items[(dev->m4_items_head + dev->m4_items_count) % GGML_METAL4_N_ALLOC];
+    it->cb     = [cb retain];
+    it->wait   = wait;
+    it->signal = signal;
+    it->after  = after;
+    dev->m4_items_count++;
+    pthread_mutex_unlock(&dev->m4_commit_mtx);
+
+    ggml_metal_mtl4_pump(dev);
+}
+
 static void ggml_metal_mtl4_wait_value(ggml_metal_device_t dev, uint64_t value) {
+    ggml_metal_mtl4_pump(dev);
     while (dev->host_event.signaledValue < value) {
         if ([dev->host_event waitUntilSignaledValue:value timeoutMS:1000]) {
             break;
@@ -1982,6 +2069,15 @@ void ggml_metal_device_mtl4_wait(ggml_metal_device_t dev, uint64_t value) {
 
 bool ggml_metal_device_mtl4_error(ggml_metal_device_t dev) {
     return atomic_load(&dev->m4_error);
+}
+
+static bool ggml_metal_host_op_check_order(ggml_metal_device_t dev, id<MTLSharedEvent> event, uint64_t v, const char * name) {
+    const uint64_t seen = event.signaledValue;
+    if (seen > v && !atomic_exchange(&dev->m4_error, true)) {
+        GGML_LOG_ERROR("%s: the GPU ran past host op %s (value %llu, event already at %llu): the graph used data the op had "
+                "not written, failing it\n", __func__, name, (unsigned long long) v, (unsigned long long) seen);
+    }
+    return !atomic_load(&dev->m4_error);
 }
 
 // first use: the queue, the pools and the residency set the queue sees (under m4_lock)
@@ -2041,6 +2137,9 @@ static void ggml_metal_mtl4_init_locked(ggml_metal_device_t dev) {
     [rset requestResidency];
     [(id<MTL4CommandQueue>) dev->q4 addResidencySet:rset];
 
+    dev->m4_items = calloc(GGML_METAL4_N_ALLOC, sizeof(struct ggml_metal_mtl4_item));
+    GGML_ASSERT(dev->m4_items != NULL);
+
     for (int i = 0; i < GGML_METAL4_N_ALLOC; ++i) {
         dev->m4_alloc[i] = [dev->mtl_device newCommandAllocator];
         GGML_ASSERT(dev->m4_alloc[i] != nil);
@@ -2084,8 +2183,8 @@ static void ggml_metal_mtl4_begin_cb(struct ggml_metal_mtl4 * m4) {
     m4->enc->m4   = m4;
 }
 
-// end the current command buffer and commit it
-static void ggml_metal_mtl4_submit_cb(struct ggml_metal_mtl4 * m4) {
+// end the current command buffer and queue it for the commit, with the pending wait before it and `signal` after it
+static void ggml_metal_mtl4_submit_cb(struct ggml_metal_mtl4 * m4, uint64_t signal) {
     ggml_metal_device_t dev = m4->dev;
 
     [m4->enc->obj4 endEncoding];
@@ -2094,8 +2193,8 @@ static void ggml_metal_mtl4_submit_cb(struct ggml_metal_mtl4 * m4) {
 
     [m4->cb endCommandBuffer];
 
-    id<MTL4CommandBuffer> cb = m4->cb;
-    [(id<MTL4CommandQueue>) dev->q4 commit:&cb count:1 options:dev->m4_opts];
+    ggml_metal_mtl4_enqueue(dev, m4->cb, m4->wait_next, signal, m4->jit ? m4->gate : 0);
+    m4->wait_next = 0;
 
     [m4->cb release];
     m4->cb = nil;
@@ -2105,8 +2204,7 @@ static void ggml_metal_mtl4_submit_cb(struct ggml_metal_mtl4 * m4) {
 static void ggml_metal_mtl4_commit_cb(struct ggml_metal_mtl4 * m4, uint64_t value) {
     ggml_metal_device_t dev = m4->dev;
 
-    ggml_metal_mtl4_submit_cb(m4);
-    [(id<MTL4CommandQueue>) dev->q4 signalEvent:dev->host_event value:value];
+    ggml_metal_mtl4_submit_cb(m4, value);
 
     [dev->m4_lock lock];
     dev->m4_alloc_value[m4->cb_alloc] = value;
@@ -2117,10 +2215,11 @@ static void ggml_metal_mtl4_commit_cb(struct ggml_metal_mtl4 * m4, uint64_t valu
     [dev->m4_lock unlock];
 }
 
-ggml_metal_mtl4_t ggml_metal_mtl4_begin(ggml_metal_device_t dev, bool serial) {
+ggml_metal_mtl4_t ggml_metal_mtl4_begin(ggml_metal_device_t dev, bool serial, bool jit) {
     struct ggml_metal_mtl4 * m4 = calloc(1, sizeof(struct ggml_metal_mtl4));
     m4->dev    = dev;
     m4->serial = serial;
+    m4->jit    = jit;
 
     // released by ggml_metal_mtl4_end: the values of a graph are reserved and signaled in queue order
     [dev->m4_graph_lock lock];
@@ -2173,14 +2272,18 @@ ggml_metal_encoder_t ggml_metal_mtl4_host_op(ggml_metal_mtl4_t m4, struct ggml_t
     if (!ggml_metal_host_spin_submit(dev, v, snap)) {
         [event notifyListener:dev->host_listener atValue:v block:^(id<MTLSharedEvent> e, uint64_t value) {
             GGML_UNUSED(value);
-            ggml_metal_host_op_run(&snap[0]);
+            ggml_metal_mtl4_pump(dev);
+            if (ggml_metal_host_op_check_order(dev, e, v, snap[0].name)) {
+                ggml_metal_host_op_run(&snap[0]);
+            }
             free(snap);
             e.signaledValue = v + 1;
         }];
     }
 
     ggml_metal_mtl4_commit_cb(m4, v);
-    [(id<MTL4CommandQueue>) dev->q4 waitForEvent:event value:v + 1];
+    m4->wait_next = v + 1;
+    m4->gate      = v;
     ggml_metal_mtl4_begin_cb(m4);
 
     return m4->enc;
@@ -2198,7 +2301,7 @@ ggml_metal_encoder_t ggml_metal_mtl4_flush(ggml_metal_mtl4_t m4) {
     [dev->m4_lock unlock];
     m4->pending_alloc[m4->n_pending++] = a;
 
-    ggml_metal_mtl4_submit_cb(m4);
+    ggml_metal_mtl4_submit_cb(m4, 0);
     ggml_metal_mtl4_begin_cb(m4);
 
     return m4->enc;

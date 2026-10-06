@@ -348,7 +348,7 @@ ggml_metal_cmd_buf_t ggml_metal_device_encode_host_op(ggml_metal_device_t dev, g
 typedef struct ggml_metal_mtl4 * ggml_metal_mtl4_t;
 
 bool                 ggml_metal_device_supports_mtl4(ggml_metal_device_t dev);
-ggml_metal_mtl4_t    ggml_metal_mtl4_begin(ggml_metal_device_t dev, bool serial); // serial: barrier after every dispatch
+ggml_metal_mtl4_t    ggml_metal_mtl4_begin(ggml_metal_device_t dev, bool serial, bool jit); // serial: barrier after every dispatch; jit: see struct ggml_metal_mtl4
 ggml_metal_encoder_t ggml_metal_mtl4_encoder(ggml_metal_mtl4_t m4);
 ggml_metal_encoder_t ggml_metal_mtl4_host_op(ggml_metal_mtl4_t m4, struct ggml_tensor * node); // returns the new encoder
 ggml_metal_encoder_t ggml_metal_mtl4_flush  (ggml_metal_mtl4_t m4); // commits what is encoded so far, returns the new encoder
