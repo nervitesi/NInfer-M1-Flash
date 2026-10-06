@@ -37,6 +37,7 @@ struct ggml_metal_op {
     ggml_metal_op(
         ggml_metal_device_t dev,
         ggml_metal_cmd_buf_t cmd_buf,
+        ggml_metal_mtl4_t m4,
         ggml_cgraph * gf,
         ggml_metal_fusion_info * finfo,
         int  idx_start,
@@ -47,7 +48,8 @@ struct ggml_metal_op {
         this->dev             = dev;
         this->lib             = ggml_metal_device_get_library(dev);
         this->cmd_buf         = cmd_buf;
-        this->enc             = ggml_metal_encoder_init(cmd_buf, use_concurrency);
+        this->m4              = m4;
+        this->enc             = m4 ? ggml_metal_mtl4_encoder(m4) : ggml_metal_encoder_init(cmd_buf, use_concurrency);
         this->mem_ranges      = ggml_mem_ranges_init(debug_graph);
         this->finfo           = finfo;
         this->idx_start       = idx_start;
@@ -70,8 +72,11 @@ struct ggml_metal_op {
     }
 
     ~ggml_metal_op() {
-        ggml_metal_encoder_end_encoding(this->enc);
-        ggml_metal_encoder_free(this->enc);
+        // a Metal 4 encoder belongs to the submission (ggml_metal_mtl4_end ends it)
+        if (!this->m4) {
+            ggml_metal_encoder_end_encoding(this->enc);
+            ggml_metal_encoder_free(this->enc);
+        }
         ggml_mem_ranges_free(this->mem_ranges);
     }
 
@@ -107,6 +112,7 @@ struct ggml_metal_op {
     ggml_metal_device_t  dev;
     ggml_metal_library_t lib;
     ggml_metal_cmd_buf_t cmd_buf;      // current command buffer (changes at host ops)
+    ggml_metal_mtl4_t    m4;           // Metal 4 submission instead of cmd_buf
     int                  n_host_split = 0;
     ggml_metal_encoder_t enc;
     ggml_mem_ranges_t    mem_ranges;
@@ -142,6 +148,7 @@ ggml_metal_op_t ggml_metal_op_init(
     ggml_metal_op_t res = new ggml_metal_op(
         dev,
         cmd_buf,
+        nullptr,
         gf,
         finfo,
         idx_start,
@@ -151,6 +158,28 @@ ggml_metal_op_t ggml_metal_op_init(
         debug_graph);
 
     return res;
+}
+
+ggml_metal_op_t ggml_metal_op_init_mtl4(
+        ggml_metal_device_t dev,
+        ggml_metal_mtl4_t m4,
+        ggml_cgraph * gf,
+        ggml_metal_fusion_info * finfo,
+        int idx_start,
+        int idx_end,
+        bool use_concurrency,
+        int debug_graph) {
+    return new ggml_metal_op(
+        dev,
+        nullptr,
+        m4,
+        gf,
+        finfo,
+        idx_start,
+        idx_end,
+        use_concurrency,
+        false,
+        debug_graph);
 }
 
 void ggml_metal_op_free(ggml_metal_op_t ctx) {
@@ -263,6 +292,14 @@ static int ggml_metal_op_encode_impl(ggml_metal_op_t ctx, int idx) {
     }
 
     // host op: a CPU round trip between two command buffers
+    if (ggml_metal_host_op_is_registered(node) && ctx->m4) {
+        ctx->enc = ggml_metal_mtl4_host_op(ctx->m4, node);
+        ctx->n_host_split++;
+        if (ctx->mem_ranges) {
+            ggml_mem_ranges_reset(ctx->mem_ranges);
+        }
+        return 1;
+    }
     if (ggml_metal_host_op_is_registered(node)) {
         ggml_metal_encoder_end_encoding(ctx->enc);
         ggml_metal_encoder_free(ctx->enc);

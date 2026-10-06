@@ -21,6 +21,17 @@ ggml_metal_op_t ggml_metal_op_init(
         bool use_capture,
         int  debug_graph);
 
+// encode into a Metal 4 submission (see ggml_metal_mtl4_begin); host ops split it through ggml_metal_mtl4_host_op
+ggml_metal_op_t ggml_metal_op_init_mtl4(
+        ggml_metal_device_t dev,
+        ggml_metal_mtl4_t m4,
+        struct ggml_cgraph * gf,
+        struct ggml_metal_fusion_info * finfo,
+        int  idx_start,
+        int  idx_end,
+        bool use_concurrency,
+        int  debug_graph);
+
 void ggml_metal_op_free(ggml_metal_op_t ctx);
 
 // command buffer the encoding ended in, and how many host ops split it (see ggml_metal_device_encode_host_op)

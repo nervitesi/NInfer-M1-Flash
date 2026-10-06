@@ -335,10 +335,25 @@ void ggml_metal_device_event_synchronize(ggml_metal_device_t dev, ggml_metal_eve
 void     ggml_metal_host_op_register(void * fun);
 bool     ggml_metal_host_op_is_registered(const struct ggml_tensor * op);
 uint64_t ggml_metal_device_host_op_reserve(ggml_metal_device_t dev, int n_ops); // first value of 2*n_ops
+
 // encodes the CPU round trip of host op `node` at the end of cmd_buf, commits cmd_buf and returns a new, enqueued and
 // retained command buffer that starts by waiting for the reply. The command buffer boundary makes the GPU see what the
 // CPU wrote (inside one command buffer it may read stale cached data). Intermediate command buffers release themselves.
 ggml_metal_cmd_buf_t ggml_metal_device_encode_host_op(ggml_metal_device_t dev, ggml_metal_cmd_buf_t cmd_buf, struct ggml_tensor * node, bool release_cmd_buf);
+
+// Metal 4 submission (GGML_METAL4): the graph is encoded into MTL4 command buffers on a Metal 4 queue. Host ops end
+// the current command buffer; the queue signals an event, the CPU runs the op and signals back, and a queue-level
+// wait releases the next command buffer. On M1 Max that round trip costs ~40 us, against ~200 us for a classic
+// command buffer that starts with encodeWaitForEvent. Requires macOS 26, a Metal 4 GPU and residency sets.
+typedef struct ggml_metal_mtl4 * ggml_metal_mtl4_t;
+
+bool                 ggml_metal_device_supports_mtl4(ggml_metal_device_t dev);
+ggml_metal_mtl4_t    ggml_metal_mtl4_begin(ggml_metal_device_t dev, bool serial); // serial: barrier after every dispatch
+ggml_metal_encoder_t ggml_metal_mtl4_encoder(ggml_metal_mtl4_t m4);
+ggml_metal_encoder_t ggml_metal_mtl4_host_op(ggml_metal_mtl4_t m4, struct ggml_tensor * node); // returns the new encoder
+uint64_t             ggml_metal_mtl4_end(ggml_metal_mtl4_t m4); // commits, frees m4, returns the completion value
+void                 ggml_metal_device_mtl4_wait(ggml_metal_device_t dev, uint64_t value);
+bool                 ggml_metal_device_mtl4_error(ggml_metal_device_t dev);
 
 void ggml_metal_device_get_memory(ggml_metal_device_t dev, size_t * free, size_t * total);
 bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_tensor * op);

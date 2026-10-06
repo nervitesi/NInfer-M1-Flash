@@ -77,6 +77,12 @@ struct ggml_metal {
     id<MTLCommandBuffer> cmd_buf_main_end; // command buffer the main thread ended in (host ops split it)
     bool has_host_ops;                     // the graph being encoded has host ops
 
+    // Metal 4 submission (GGML_METAL4): 0 off, 1 graphs with host ops, 2 every graph
+    // the Metal 4 queue and the classic queue are not ordered against each other: before work goes to one,
+    // the CPU waits for the context's pending work on the other
+    int      m4_mode;
+    uint64_t m4_last; // completion value of the last Metal 4 graph, 0 when none is pending
+
     // abort ggml_metal_graph_compute if callback returns true
     ggml_abort_callback abort_callback;
     void *              abort_callback_data;
@@ -160,9 +166,23 @@ ggml_metal_t ggml_metal_init(ggml_metal_device_t dev) {
             res->n_cb = 0;
         }
 
+        res->m4_mode = 0;
+        res->m4_last = 0;
+        {
+            const char * val = getenv("GGML_METAL4");
+            if (val && atoi(val) > 0) {
+                if (ggml_metal_device_supports_mtl4(dev)) {
+                    res->m4_mode = atoi(val) >= 2 ? 2 : 1;
+                } else {
+                    GGML_LOG_WARN("%s: GGML_METAL4 ignored: it needs macOS 26, a Metal 4 GPU and residency sets\n", __func__);
+                }
+            }
+        }
+
         GGML_LOG_INFO("%s: use fusion         = %s\n", __func__, ggml_metal_fusion_info_enabled(res->finfo) ? "true" : "false");
         GGML_LOG_INFO("%s: use concurrency    = %s\n", __func__, res->use_concurrency    ? "true" : "false");
         GGML_LOG_INFO("%s: use graph optimize = %s\n", __func__, res->use_graph_optimize ? "true" : "false");
+        GGML_LOG_INFO("%s: use Metal 4        = %s\n", __func__, res->m4_mode == 2 ? "all graphs" : res->m4_mode == 1 ? "graphs with host ops" : "false");
 
         res->capture_compute = 0;
         res->capture_started = false;
@@ -194,8 +214,17 @@ ggml_metal_t ggml_metal_init(ggml_metal_device_t dev) {
     }
 }
 
+// the context's Metal 4 graphs are done
+static void ggml_metal_wait_mtl4(ggml_metal_t ctx) {
+    if (ctx->m4_last > 0) {
+        ggml_metal_device_mtl4_wait(ctx->dev, ctx->m4_last);
+    }
+}
+
 void ggml_metal_free(ggml_metal_t ctx) {
     GGML_LOG_INFO("%s: deallocating\n", __func__);
+
+    ggml_metal_wait_mtl4(ctx);
 
     for (int i = 0; i < GGML_METAL_MAX_COMMAND_BUFFERS; ++i) {
         if (ctx->cmd_bufs[i].obj) {
@@ -254,6 +283,17 @@ const char * ggml_metal_get_name(ggml_metal_t ctx) {
 }
 
 void ggml_metal_synchronize(ggml_metal_t ctx) {
+    if (ctx->m4_last > 0) {
+        ggml_metal_wait_mtl4(ctx);
+        ctx->m4_last = 0;
+
+        if (ggml_metal_device_mtl4_error(ctx->dev)) {
+            GGML_LOG_ERROR("%s: error: a Metal 4 command buffer failed\n", __func__);
+            ctx->has_error = true;
+            return;
+        }
+    }
+
     // wait for any backend operations to finish
     if (ctx->cmd_buf_last) {
         [ctx->cmd_buf_last waitUntilCompleted];
@@ -326,6 +366,8 @@ static struct ggml_metal_buffer_id ggml_metal_get_buffer_id(const struct ggml_te
 }
 
 void ggml_metal_set_tensor_async(ggml_metal_t ctx, struct ggml_tensor * tensor, const void * data, size_t offset, size_t size) {
+    ggml_metal_wait_mtl4(ctx);
+
     @autoreleasepool {
         // wrap the source data into a Metal buffer
         id<MTLDevice> device = ggml_metal_device_get_obj(ctx->dev);
@@ -372,6 +414,17 @@ void ggml_metal_set_tensor_async(ggml_metal_t ctx, struct ggml_tensor * tensor, 
 }
 
 void ggml_metal_get_tensor_async(ggml_metal_t ctx, const struct ggml_tensor * tensor, void * data, size_t offset, size_t size) {
+    if (ctx->m4_last > 0) {
+        ggml_metal_wait_mtl4(ctx);
+
+        // nothing else pending and the data is visible to the CPU: copy it now, without a classic command buffer
+        ggml_backend_buffer_t buffer = tensor->view_src ? tensor->view_src->buffer : tensor->buffer;
+        if (ctx->cmd_buf_last == nil && ggml_metal_buffer_is_shared(buffer->context)) {
+            memcpy(data, (const char *) tensor->data + offset, size);
+            return;
+        }
+    }
+
     @autoreleasepool {
         id<MTLDevice> device = ggml_metal_device_get_obj(ctx->dev);
         id<MTLBuffer> buf_dst = [device newBufferWithBytesNoCopy:data
@@ -418,6 +471,9 @@ void ggml_metal_get_tensor_async(ggml_metal_t ctx, const struct ggml_tensor * te
 }
 
 bool ggml_metal_cpy_tensor_async(ggml_metal_t ctx_src, ggml_metal_t ctx_dst, const struct ggml_tensor * src, struct ggml_tensor * dst) {
+    ggml_metal_wait_mtl4(ctx_src);
+    ggml_metal_wait_mtl4(ctx_dst);
+
     @autoreleasepool {
         struct ggml_metal_buffer_id bid_src = ggml_metal_get_buffer_id(src);
         struct ggml_metal_buffer_id bid_dst = ggml_metal_get_buffer_id(dst);
@@ -473,6 +529,49 @@ bool ggml_metal_cpy_tensor_async(ggml_metal_t ctx_src, ggml_metal_t ctx_dst, con
     }
 }
 
+// the whole graph on the Metal 4 queue, encoded by the calling thread; host ops split it into several command buffers
+static enum ggml_status ggml_metal_graph_compute_mtl4(ggml_metal_t ctx, struct ggml_cgraph * gf) {
+    if (ctx->cmd_buf_last) {
+        [ctx->cmd_buf_last waitUntilCompleted];
+        ctx->cmd_buf_last = nil;
+    }
+
+    if (ctx->capture_compute >= 0) {
+        ctx->capture_compute--;
+    }
+
+    @autoreleasepool {
+        ggml_metal_mtl4_t m4 = ggml_metal_mtl4_begin(ctx->dev, !ctx->use_concurrency);
+
+        ggml_metal_op_t ctx_op = ggml_metal_op_init_mtl4(
+            ctx->dev,
+            m4,
+            gf,
+            ctx->finfo,
+            0,
+            gf->n_nodes,
+            ctx->use_concurrency,
+            ctx->debug_graph);
+
+        for (int idx = 0; idx < ggml_metal_op_n_nodes(ctx_op); ++idx) {
+            const int res = ggml_metal_op_encode(ctx_op, idx);
+            if (res == 0) {
+                break;
+            }
+
+            idx += res - 1;
+        }
+
+        ggml_metal_op_free(ctx_op);
+
+        ctx->m4_last = ggml_metal_mtl4_end(m4);
+    }
+
+    ggml_metal_op_count_dump(gf->n_nodes);
+
+    return GGML_STATUS_SUCCESS;
+}
+
 enum ggml_status ggml_metal_graph_compute(ggml_metal_t ctx, struct ggml_cgraph * gf) {
     if (ctx->has_error) {
         GGML_LOG_ERROR("%s: backend is in error state from a previous command buffer failure - recreate the backend to recover\n", __func__);
@@ -492,14 +591,21 @@ enum ggml_status ggml_metal_graph_compute(ggml_metal_t ctx, struct ggml_cgraph *
     // keep the memory wired
     ggml_metal_device_rsets_keep_alive(ctx->dev);
 
+    int n_host = 0;
+    for (int i = 0; i < gf->n_nodes; ++i) {
+        n_host += ggml_metal_host_op_is_registered(gf->nodes[i]);
+    }
+    ctx->has_host_ops = n_host > 0;
+
+    if ((ctx->m4_mode == 2 || (ctx->m4_mode == 1 && n_host > 0)) && ctx->capture_compute != 1) {
+        return ggml_metal_graph_compute_mtl4(ctx, gf);
+    }
+
+    ggml_metal_wait_mtl4(ctx);
+
     // host ops get their event values in graph order: the command buffers are encoded in parallel but
     // run in order, and the values must grow along the execution
     {
-        int n_host = 0;
-        for (int i = 0; i < gf->n_nodes; ++i) {
-            n_host += ggml_metal_host_op_is_registered(gf->nodes[i]);
-        }
-        ctx->has_host_ops = n_host > 0;
         if (n_host > 0) {
             uint64_t v = ggml_metal_device_host_op_reserve(ctx->dev, n_host);
             for (int i = 0; i < gf->n_nodes; ++i) {
@@ -695,6 +801,8 @@ void ggml_metal_graph_optimize(ggml_metal_t ctx, struct ggml_cgraph * gf) {
 }
 
 void ggml_metal_event_record(ggml_metal_t ctx, ggml_metal_event_t ev) {
+    ggml_metal_wait_mtl4(ctx);
+
     @autoreleasepool {
         id<MTLCommandQueue> queue = ggml_metal_device_get_queue(ctx->dev);
         id<MTLCommandBuffer> cmd_buf = [queue commandBuffer];
@@ -711,6 +819,8 @@ void ggml_metal_event_record(ggml_metal_t ctx, ggml_metal_event_t ev) {
 }
 
 void ggml_metal_event_wait(ggml_metal_t ctx, ggml_metal_event_t ev) {
+    ggml_metal_wait_mtl4(ctx);
+
     @autoreleasepool {
         id<MTLCommandQueue> queue = ggml_metal_device_get_queue(ctx->dev);
         id<MTLCommandBuffer> cmd_buf = [queue commandBuffer];

@@ -28,6 +28,12 @@
 static const NSInteger MTLGPUFamilyMetal3_GGML = 5001;
 static const NSInteger MTLGPUFamilyMetal4_GGML = 5002;
 
+// Metal 4 submission pools: command allocators (one per command buffer in flight) and per-graph slots
+// (constants buffer + argument table); a graph with host ops uses one command buffer per segment
+#define GGML_METAL4_N_ALLOC     512
+#define GGML_METAL4_N_SLOT      4
+#define GGML_METAL4_CBUF_SIZE   (32u*1024u*1024u)
+
 // MTLLanguageVersion4_0 is not present in older SDKs
 static const NSUInteger MTLLanguageVersion4_0_GGML = 4 << 16;
 
@@ -827,9 +833,24 @@ struct ggml_metal_pipeline_with_params ggml_metal_library_compile_pipeline(ggml_
 // MTLComputeCommandEncoder wrapper
 //
 
+// the Metal 4 code below is only reached after ggml_metal_device_supports_mtl4() checked macOS 26
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wunguarded-availability-new"
+
+struct ggml_metal_mtl4;
+
 struct ggml_metal_encoder {
     id<MTLComputeCommandEncoder> obj;
+
+    // Metal 4 (null for classic encoders): bindings go through the graph's argument table, small constants
+    // through its constants buffer
+    id<MTL4ComputeCommandEncoder> obj4;
+    struct ggml_metal_mtl4      * m4;
 };
+
+static void ggml_metal_mtl4_set_bytes  (struct ggml_metal_mtl4 * m4, const void * data, size_t size, int idx);
+static void ggml_metal_mtl4_set_address(struct ggml_metal_mtl4 * m4, uint64_t addr, int idx);
+static bool ggml_metal_mtl4_serial     (struct ggml_metal_mtl4 * m4);
 
 ggml_metal_encoder_t ggml_metal_encoder_init(ggml_metal_cmd_buf_t cmd_buf_raw, bool concurrent) {
     ggml_metal_encoder_t res = calloc(1, sizeof(struct ggml_metal_encoder));
@@ -848,18 +869,31 @@ ggml_metal_encoder_t ggml_metal_encoder_init(ggml_metal_cmd_buf_t cmd_buf_raw, b
 }
 
 void ggml_metal_encoder_free(ggml_metal_encoder_t encoder) {
-    [encoder->obj release];
+    if (encoder->obj4) {
+        [encoder->obj4 release];
+    } else {
+        [encoder->obj release];
+    }
     free(encoder);
 }
 
 void ggml_metal_encoder_debug_group_push(ggml_metal_encoder_t encoder, const char * name) {
     @autoreleasepool {
-        [encoder->obj pushDebugGroup:[NSString stringWithCString:name encoding:NSUTF8StringEncoding]];
+        NSString * str = [NSString stringWithCString:name encoding:NSUTF8StringEncoding];
+        if (encoder->obj4) {
+            [encoder->obj4 pushDebugGroup:str];
+        } else {
+            [encoder->obj pushDebugGroup:str];
+        }
     }
 }
 
 void ggml_metal_encoder_debug_group_pop (ggml_metal_encoder_t encoder) {
-    [encoder->obj popDebugGroup];
+    if (encoder->obj4) {
+        [encoder->obj4 popDebugGroup];
+    } else {
+        [encoder->obj popDebugGroup];
+    }
 }
 
 void ggml_metal_encoder_set_pipeline(ggml_metal_encoder_t encoder, struct ggml_metal_pipeline_with_params pipeline) {
@@ -867,22 +901,39 @@ void ggml_metal_encoder_set_pipeline(ggml_metal_encoder_t encoder, struct ggml_m
         GGML_ABORT("%s: nil Metal pipeline (missing kernel; see compile_pipeline log above)\n", __func__);
     }
 
-    [encoder->obj setComputePipelineState:pipeline.pipeline->obj];
+    if (encoder->obj4) {
+        [encoder->obj4 setComputePipelineState:pipeline.pipeline->obj];
+    } else {
+        [encoder->obj setComputePipelineState:pipeline.pipeline->obj];
+    }
 }
 
 void ggml_metal_encoder_set_bytes(ggml_metal_encoder_t encoder, void * data, size_t size, int idx) {
-    [encoder->obj setBytes:data length:size atIndex:idx];
+    if (encoder->obj4) {
+        ggml_metal_mtl4_set_bytes(encoder->m4, data, size, idx);
+    } else {
+        [encoder->obj setBytes:data length:size atIndex:idx];
+    }
 }
 
 void ggml_metal_encoder_set_buffer(ggml_metal_encoder_t encoder, struct ggml_metal_buffer_id buffer, int idx) {
-    [encoder->obj setBuffer:buffer.metal offset:buffer.offs atIndex:idx];
+    if (encoder->obj4) {
+        id<MTLBuffer> buf = (id<MTLBuffer>) buffer.metal;
+        ggml_metal_mtl4_set_address(encoder->m4, buf ? buf.gpuAddress + buffer.offs : 0, idx);
+    } else {
+        [encoder->obj setBuffer:buffer.metal offset:buffer.offs atIndex:idx];
+    }
 }
 
 void ggml_metal_encoder_set_threadgroup_memory_size(ggml_metal_encoder_t encoder, size_t size, int idx) {
     // ref: https://developer.apple.com/documentation/metal/mtlcomputecommandencoder/setthreadgroupmemorylength(_:index:)
     GGML_ASSERT(size % 16 == 0);
 
-    [encoder->obj setThreadgroupMemoryLength:size atIndex:idx];
+    if (encoder->obj4) {
+        [encoder->obj4 setThreadgroupMemoryLength:size atIndex:idx];
+    } else {
+        [encoder->obj setThreadgroupMemoryLength:size atIndex:idx];
+    }
 }
 
 // NInfer-M1 diagnostic (GGML_METAL_COUNT): number of dispatches encoded
@@ -890,16 +941,37 @@ int64_t g_ggml_metal_n_dispatch = 0;
 
 void ggml_metal_encoder_dispatch_threadgroups(ggml_metal_encoder_t encoder, int tg0, int tg1, int tg2, int tptg0, int tptg1, int tptg2) {
     __atomic_fetch_add(&g_ggml_metal_n_dispatch, 1, __ATOMIC_RELAXED);
-    [encoder->obj dispatchThreadgroups:MTLSizeMake(tg0, tg1, tg2) threadsPerThreadgroup:MTLSizeMake(tptg0, tptg1, tptg2)];
+    if (encoder->obj4) {
+        [encoder->obj4 dispatchThreadgroups:MTLSizeMake(tg0, tg1, tg2) threadsPerThreadgroup:MTLSizeMake(tptg0, tptg1, tptg2)];
+        // a Metal 4 encoder runs its dispatches concurrently; without the concurrency tracking of the op
+        // encoder, keep the classic serial order with a barrier after each one
+        if (ggml_metal_mtl4_serial(encoder->m4)) {
+            ggml_metal_encoder_memory_barrier(encoder);
+        }
+    } else {
+        [encoder->obj dispatchThreadgroups:MTLSizeMake(tg0, tg1, tg2) threadsPerThreadgroup:MTLSizeMake(tptg0, tptg1, tptg2)];
+    }
 }
 
 void ggml_metal_encoder_memory_barrier(ggml_metal_encoder_t encoder) {
-    [encoder->obj memoryBarrierWithScope:MTLBarrierScopeBuffers];
+    if (encoder->obj4) {
+        [encoder->obj4 barrierAfterEncoderStages:MTLStageDispatch
+                             beforeEncoderStages:MTLStageDispatch
+                               visibilityOptions:MTL4VisibilityOptionDevice];
+    } else {
+        [encoder->obj memoryBarrierWithScope:MTLBarrierScopeBuffers];
+    }
 }
 
 void ggml_metal_encoder_end_encoding(ggml_metal_encoder_t encoder) {
-    [encoder->obj endEncoding];
+    if (encoder->obj4) {
+        [encoder->obj4 endEncoding];
+    } else {
+        [encoder->obj endEncoding];
+    }
 }
+
+#pragma clang diagnostic pop
 
 struct ggml_metal_device {
     id<MTLDevice> mtl_device;
@@ -925,6 +997,22 @@ struct ggml_metal_device {
     id<MTLSharedEvent>       host_event;
     MTLSharedEventListener * host_listener;
     atomic_uint_fast64_t     host_value;
+
+    // Metal 4 submission, created on first use (see ggml_metal_mtl4_begin); completion values on host_event
+    NSLock * m4_lock;           // pools
+    NSLock * m4_graph_lock;     // one graph encodes at a time: event values are reserved in queue order
+    size_t   m4_cbuf_peak;      // most constants bytes used by a graph
+    id       q4;                // id<MTL4CommandQueue>
+    id       m4_opts;           // MTL4CommitOptions with the error feedback handler
+    id       m4_alloc[GGML_METAL4_N_ALLOC];       // id<MTL4CommandAllocator>
+    uint64_t m4_alloc_value[GGML_METAL4_N_ALLOC]; // free once host_event reaches it
+    int      m4_alloc_next;
+    id       m4_cbuf [GGML_METAL4_N_SLOT];        // id<MTLBuffer>, constants of one graph in flight
+    id       m4_table[GGML_METAL4_N_SLOT];        // id<MTL4ArgumentTable>
+    uint64_t m4_slot_value[GGML_METAL4_N_SLOT];
+    int      m4_slot_next;
+    id       m4_rset;           // every ggml buffer and the constants buffers, attached to q4 (under rsets->lock)
+    atomic_bool m4_error;
 };
 
 //
@@ -1133,6 +1221,8 @@ ggml_metal_device_t ggml_metal_device_init(int device, int n_devices) {
                 dev->addr_virt = 0x000000400ULL;
 
                 dev->host_event = [dev->mtl_device newSharedEvent];
+                dev->m4_lock = [[NSLock alloc] init];
+                dev->m4_graph_lock = [[NSLock alloc] init];
                 dev->host_listener = [[MTLSharedEventListener alloc] initWithDispatchQueue:
                     dispatch_queue_create("ggml-metal-host-op", DISPATCH_QUEUE_SERIAL)];
                 atomic_store(&dev->host_value, 0);
@@ -1401,6 +1491,22 @@ void ggml_metal_device_free(ggml_metal_device_t dev) {
             dev->mtl_queue = nil;
         }
 
+        if (dev->q4) {
+            for (int i = 0; i < GGML_METAL4_N_ALLOC; ++i) {
+                [dev->m4_alloc[i] release];
+            }
+            for (int i = 0; i < GGML_METAL4_N_SLOT; ++i) {
+                [dev->m4_cbuf[i] release];
+                [dev->m4_table[i] release];
+            }
+            [dev->m4_rset release];
+            [dev->m4_opts release];
+            [dev->q4 release];
+            dev->q4 = nil;
+        }
+        [dev->m4_lock release];
+        [dev->m4_graph_lock release];
+
         if (dev->host_listener) {
             [dev->host_listener release];
             dev->host_listener = nil;
@@ -1432,6 +1538,29 @@ ggml_metal_library_t ggml_metal_device_get_library(ggml_metal_device_t dev) {
     return dev->library;
 }
 
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wunguarded-availability-new"
+
+// Metal 4 command buffers see only the allocations of residency sets attached to them or to their queue, at most 32
+// sets per command buffer: one set on the queue holds the allocations of every buffer (call with rsets->lock held)
+static void ggml_metal_mtl4_rset_update_locked(ggml_metal_device_t dev, id<MTLResidencySet> rset, bool add) {
+    if (dev->m4_rset == nil) {
+        return;
+    }
+
+    id<MTLResidencySet> all = dev->m4_rset;
+    for (id<MTLAllocation> a in rset.allAllocations) {
+        if (add) {
+            [all addAllocation:a];
+        } else {
+            [all removeAllocation:a];
+        }
+    }
+    [all commit];
+}
+
+#pragma clang diagnostic pop
+
 void ggml_metal_device_rsets_add(ggml_metal_device_t dev, ggml_metal_rset_t rset) {
     if (rset == nil) {
         return;
@@ -1442,6 +1571,7 @@ void ggml_metal_device_rsets_add(ggml_metal_device_t dev, ggml_metal_rset_t rset
     [dev->rsets->lock lock];
 
     [dev->rsets->data addObject:rset];
+    ggml_metal_mtl4_rset_update_locked(dev, rset, true);
 
     [dev->rsets->lock unlock];
 }
@@ -1455,6 +1585,7 @@ void ggml_metal_device_rsets_rm(ggml_metal_device_t dev, ggml_metal_rset_t rset)
 
     [dev->rsets->lock lock];
 
+    ggml_metal_mtl4_rset_update_locked(dev, rset, false);
     [dev->rsets->data removeObject:rset];
 
     [dev->rsets->lock unlock];
@@ -1645,6 +1776,293 @@ ggml_metal_cmd_buf_t ggml_metal_device_encode_host_op(ggml_metal_device_t dev, g
 
     return (ggml_metal_cmd_buf_t) next;
 }
+
+//
+// Metal 4 submission
+//
+
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wunguarded-availability-new"
+
+struct ggml_metal_mtl4 {
+    ggml_metal_device_t dev;
+
+    bool serial; // barrier after every dispatch
+
+    // per-graph slot: constants buffer and argument table, free again once host_event reaches the end value
+    int        slot;
+    uint8_t  * cbuf_base;
+    uint64_t   cbuf_gpu;
+    size_t     cbuf_off;
+
+    id<MTL4ArgumentTable> table;
+
+    // current command buffer and its encoder
+    id<MTL4CommandBuffer> cb;
+    int                   cb_alloc;
+
+    struct ggml_metal_encoder * enc;
+};
+
+bool ggml_metal_device_supports_mtl4(ggml_metal_device_t dev) {
+    if (@available(macOS 26.0, iOS 26.0, *)) {
+        return dev->rsets != nil && dev->props.use_residency_sets && [dev->mtl_device supportsFamily:MTLGPUFamilyMetal4_GGML];
+    }
+    return false;
+}
+
+static void ggml_metal_mtl4_wait_value(ggml_metal_device_t dev, uint64_t value) {
+    while (dev->host_event.signaledValue < value) {
+        if ([dev->host_event waitUntilSignaledValue:value timeoutMS:1000]) {
+            break;
+        }
+        // after a failed command buffer the signal may never come
+        if (atomic_load(&dev->m4_error)) {
+            break;
+        }
+    }
+}
+
+void ggml_metal_device_mtl4_wait(ggml_metal_device_t dev, uint64_t value) {
+    ggml_metal_mtl4_wait_value(dev, value);
+}
+
+bool ggml_metal_device_mtl4_error(ggml_metal_device_t dev) {
+    return atomic_load(&dev->m4_error);
+}
+
+// first use: the queue, the pools and the residency set the queue sees (under m4_lock)
+static void ggml_metal_mtl4_init_locked(ggml_metal_device_t dev) {
+    if (dev->q4 != nil) {
+        return;
+    }
+
+    dev->q4 = [dev->mtl_device newMTL4CommandQueue];
+    GGML_ASSERT(dev->q4 != nil);
+
+    MTL4CommitOptions * opts = [[MTL4CommitOptions alloc] init];
+    [opts addFeedbackHandler:^(id<MTL4CommitFeedback> fb) {
+        if (fb.error) {
+            GGML_LOG_ERROR("ggml_metal_mtl4: command buffer failed: %s\n", [[fb.error description] UTF8String]);
+            atomic_store(&dev->m4_error, true);
+        }
+    }];
+    dev->m4_opts = opts;
+
+    MTLResidencySetDescriptor * desc = [[MTLResidencySetDescriptor alloc] init];
+    desc.label = @"ggml_metal_mtl4";
+    NSError * error = nil;
+    id<MTLResidencySet> rset = [dev->mtl_device newResidencySetWithDescriptor:desc error:&error];
+    [desc release];
+    GGML_ASSERT(rset != nil);
+
+    MTL4ArgumentTableDescriptor * atd = [[MTL4ArgumentTableDescriptor alloc] init];
+    atd.maxBufferBindCount = 31;
+
+    for (int i = 0; i < GGML_METAL4_N_SLOT; ++i) {
+        id<MTLBuffer> buf = [dev->mtl_device newBufferWithLength:GGML_METAL4_CBUF_SIZE options:MTLResourceStorageModeShared];
+        GGML_ASSERT(buf != nil);
+        [rset addAllocation:buf];
+        dev->m4_cbuf[i] = buf;
+
+        id<MTL4ArgumentTable> table = [dev->mtl_device newArgumentTableWithDescriptor:atd error:&error];
+        GGML_ASSERT(table != nil);
+        dev->m4_table[i] = table;
+
+        dev->m4_slot_value[i] = 0;
+    }
+    [atd release];
+
+    // from now on ggml_metal_device_rsets_add/rm keep the set in sync with the buffers
+    [dev->rsets->lock lock];
+    for (id<MTLResidencySet> buf_rset in dev->rsets->data) {
+        for (id<MTLAllocation> a in buf_rset.allAllocations) {
+            [rset addAllocation:a];
+        }
+    }
+    [rset commit];
+    dev->m4_rset = rset;
+    const int n_alloc = (int) rset.allocationCount;
+    [dev->rsets->lock unlock];
+
+    [rset requestResidency];
+    [(id<MTL4CommandQueue>) dev->q4 addResidencySet:rset];
+
+    for (int i = 0; i < GGML_METAL4_N_ALLOC; ++i) {
+        dev->m4_alloc[i] = [dev->mtl_device newCommandAllocator];
+        GGML_ASSERT(dev->m4_alloc[i] != nil);
+        dev->m4_alloc_value[i] = 0;
+    }
+
+    GGML_LOG_INFO("%s: Metal 4 submission ready (%d command allocators, %d graph slots of %u MiB constants, %d allocations resident)\n",
+            __func__, GGML_METAL4_N_ALLOC, GGML_METAL4_N_SLOT, GGML_METAL4_CBUF_SIZE >> 20, n_alloc);
+}
+
+static void ggml_metal_mtl4_begin_cb(struct ggml_metal_mtl4 * m4) {
+    ggml_metal_device_t dev = m4->dev;
+
+    // an allocator holds the command memory until the GPU completes its command buffer
+    [dev->m4_lock lock];
+    const int a = dev->m4_alloc_next;
+    dev->m4_alloc_next = (dev->m4_alloc_next + 1) % GGML_METAL4_N_ALLOC;
+    const uint64_t busy_until = dev->m4_alloc_value[a];
+    [dev->m4_lock unlock];
+
+    ggml_metal_mtl4_wait_value(dev, busy_until);
+
+    id<MTL4CommandAllocator> alloc = dev->m4_alloc[a];
+    [alloc reset];
+
+    m4->cb_alloc = a;
+    m4->cb = [dev->mtl_device newCommandBuffer];
+    [m4->cb beginCommandBufferWithAllocator:alloc];
+
+    id<MTL4ComputeCommandEncoder> enc = [m4->cb computeCommandEncoder];
+    [enc retain];
+    [enc setArgumentTable:m4->table];
+
+    // the previous command buffers in the queue (earlier segments and graphs) finish before this one runs
+    [enc barrierAfterQueueStages:MTLStageDispatch | MTLStageBlit
+                    beforeStages:MTLStageDispatch
+               visibilityOptions:MTL4VisibilityOptionDevice];
+
+    m4->enc = calloc(1, sizeof(struct ggml_metal_encoder));
+    m4->enc->obj4 = enc;
+    m4->enc->m4   = m4;
+}
+
+// end the current command buffer, commit it and signal `value` on the queue once it is done
+static void ggml_metal_mtl4_commit_cb(struct ggml_metal_mtl4 * m4, uint64_t value) {
+    ggml_metal_device_t dev = m4->dev;
+
+    [m4->enc->obj4 endEncoding];
+    ggml_metal_encoder_free(m4->enc);
+    m4->enc = NULL;
+
+    [m4->cb endCommandBuffer];
+
+    id<MTL4CommandBuffer> cb = m4->cb;
+    [(id<MTL4CommandQueue>) dev->q4 commit:&cb count:1 options:dev->m4_opts];
+    [(id<MTL4CommandQueue>) dev->q4 signalEvent:dev->host_event value:value];
+
+    [dev->m4_lock lock];
+    dev->m4_alloc_value[m4->cb_alloc] = value;
+    [dev->m4_lock unlock];
+
+    [m4->cb release];
+    m4->cb = nil;
+}
+
+ggml_metal_mtl4_t ggml_metal_mtl4_begin(ggml_metal_device_t dev, bool serial) {
+    struct ggml_metal_mtl4 * m4 = calloc(1, sizeof(struct ggml_metal_mtl4));
+    m4->dev    = dev;
+    m4->serial = serial;
+
+    // released by ggml_metal_mtl4_end: the values of a graph are reserved and signaled in queue order
+    [dev->m4_graph_lock lock];
+
+    [dev->m4_lock lock];
+    ggml_metal_mtl4_init_locked(dev);
+    const int slot = dev->m4_slot_next;
+    dev->m4_slot_next = (dev->m4_slot_next + 1) % GGML_METAL4_N_SLOT;
+    const uint64_t busy_until = dev->m4_slot_value[slot];
+    [dev->m4_lock unlock];
+
+    // the slot's constants buffer is still read by a graph in flight
+    ggml_metal_mtl4_wait_value(dev, busy_until);
+
+    m4->slot      = slot;
+    m4->cbuf_base = (uint8_t *) [(id<MTLBuffer>) dev->m4_cbuf[slot] contents];
+    m4->cbuf_gpu  = [(id<MTLBuffer>) dev->m4_cbuf[slot] gpuAddress];
+    m4->cbuf_off  = 0;
+    m4->table     = dev->m4_table[slot];
+
+    ggml_metal_mtl4_begin_cb(m4);
+
+    return m4;
+}
+
+ggml_metal_encoder_t ggml_metal_mtl4_encoder(ggml_metal_mtl4_t m4) {
+    return m4->enc;
+}
+
+ggml_metal_encoder_t ggml_metal_mtl4_host_op(ggml_metal_mtl4_t m4, struct ggml_tensor * node) {
+    ggml_metal_device_t dev = m4->dev;
+    id<MTLSharedEvent> event = dev->host_event;
+
+    // encoding is single-threaded and in node order, so the values can be reserved right here
+    const uint64_t v = atomic_fetch_add(&dev->host_value, 2) + 1;
+
+    // snapshot the node and its sources: the op runs when the GPU gets here, possibly after llama has
+    // reset the graph and built the next one in the same memory
+    struct ggml_tensor * snap = (struct ggml_tensor *) malloc(sizeof(struct ggml_tensor)*(1 + GGML_MAX_SRC));
+    GGML_ASSERT(snap != NULL);
+    memcpy(&snap[0], node, sizeof(struct ggml_tensor));
+    for (int j = 0; j < GGML_MAX_SRC; ++j) {
+        if (node->src[j]) {
+            memcpy(&snap[1 + j], node->src[j], sizeof(struct ggml_tensor));
+            snap[0].src[j] = &snap[1 + j];
+        }
+    }
+
+    // registered before the commit, so the signal cannot be missed; the reply must always be sent
+    [event notifyListener:dev->host_listener atValue:v block:^(id<MTLSharedEvent> e, uint64_t value) {
+        GGML_UNUSED(value);
+        ggml_metal_host_op_run(&snap[0]);
+        free(snap);
+        e.signaledValue = v + 1;
+    }];
+
+    ggml_metal_mtl4_commit_cb(m4, v);
+    [(id<MTL4CommandQueue>) dev->q4 waitForEvent:event value:v + 1];
+    ggml_metal_mtl4_begin_cb(m4);
+
+    return m4->enc;
+}
+
+uint64_t ggml_metal_mtl4_end(ggml_metal_mtl4_t m4) {
+    ggml_metal_device_t dev = m4->dev;
+
+    const uint64_t v = atomic_fetch_add(&dev->host_value, 2) + 1;
+    ggml_metal_mtl4_commit_cb(m4, v);
+
+    [dev->m4_lock lock];
+    dev->m4_slot_value[m4->slot] = v;
+    if (m4->cbuf_off > dev->m4_cbuf_peak) {
+        dev->m4_cbuf_peak = m4->cbuf_off;
+        if (getenv("GGML_METAL4_DEBUG")) {
+            GGML_LOG_INFO("%s: constants peak %.2f MiB per graph\n", __func__, m4->cbuf_off/1024.0/1024.0);
+        }
+    }
+    [dev->m4_lock unlock];
+
+    [dev->m4_graph_lock unlock];
+
+    free(m4);
+
+    return v;
+}
+
+static void ggml_metal_mtl4_set_bytes(struct ggml_metal_mtl4 * m4, const void * data, size_t size, int idx) {
+    const size_t off = (m4->cbuf_off + 31) & ~(size_t) 31;
+    if (off + size > GGML_METAL4_CBUF_SIZE) {
+        GGML_ABORT("%s: constants buffer full (%u MiB per graph)\n", __func__, GGML_METAL4_CBUF_SIZE >> 20);
+    }
+    memcpy(m4->cbuf_base + off, data, size);
+    m4->cbuf_off = off + size;
+
+    [m4->table setAddress:m4->cbuf_gpu + off atIndex:idx];
+}
+
+static void ggml_metal_mtl4_set_address(struct ggml_metal_mtl4 * m4, uint64_t addr, int idx) {
+    [m4->table setAddress:addr atIndex:idx];
+}
+
+static bool ggml_metal_mtl4_serial(struct ggml_metal_mtl4 * m4) {
+    return m4->serial;
+}
+
+#pragma clang diagnostic pop
 
 void ggml_metal_device_get_memory(ggml_metal_device_t dev, size_t * free, size_t * total) {
     if (@available(macOS 10.12, iOS 16.0, *)) {
