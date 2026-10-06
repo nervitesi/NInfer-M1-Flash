@@ -1496,6 +1496,10 @@ void llama_moe_stream_wave_pairs(ggml_tensor * dst, int ith, int nth, void * use
     const int64_t   n   = ggml_nelements(a);
     const int32_t * ids = (const int32_t *) a->data;
           int32_t * out = (int32_t *) dst->data;
+    if (ids == nullptr || out == nullptr) {
+        GGML_ABORT("wave_pairs: null data: a=%s %p buf=%p, dst=%s %p buf=%p, view_src=%p",
+                a->name, a->data, (void *) a->buffer, dst->name, dst->data, (void *) dst->buffer, (void *) a->view_src);
+    }
 
     std::unique_lock<std::mutex> lk = stage_wave_for_op(*sl, w, ids, n, (uint32_t) a->ne[0]);
 

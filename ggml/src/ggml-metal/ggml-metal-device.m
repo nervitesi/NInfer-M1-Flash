@@ -1607,11 +1607,25 @@ ggml_metal_cmd_buf_t ggml_metal_device_encode_host_op(ggml_metal_device_t dev, g
     memcpy(&v, (const char *) node->op_params + GGML_METAL_HOST_OP_VALUE_OFFS, sizeof(v));
     GGML_ASSERT(v > 0 && "host op value not assigned");
 
+    // The op runs when the GPU gets here, possibly after llama has already reset the graph and built the
+    // next one in the same memory (ubatches are pipelined). Snapshot the node and its sources now: the
+    // buffers they point into stay valid until the backend is synchronized.
+    struct ggml_tensor * snap = (struct ggml_tensor *) malloc(sizeof(struct ggml_tensor)*(1 + GGML_MAX_SRC));
+    GGML_ASSERT(snap != NULL);
+    memcpy(&snap[0], node, sizeof(struct ggml_tensor));
+    for (int j = 0; j < GGML_MAX_SRC; ++j) {
+        if (node->src[j]) {
+            memcpy(&snap[1 + j], node->src[j], sizeof(struct ggml_tensor));
+            snap[0].src[j] = &snap[1 + j];
+        }
+    }
+
     // registered before the command buffer is committed, so the signal cannot be missed; the reply
     // must always be sent, the GPU is blocked on it
     [event notifyListener:dev->host_listener atValue:v block:^(id<MTLSharedEvent> e, uint64_t value) {
         GGML_UNUSED(value);
-        ggml_metal_host_op_run(node);
+        ggml_metal_host_op_run(&snap[0]);
+        free(snap);
         e.signaledValue = v + 1;
     }];
 
