@@ -74,6 +74,8 @@ struct ggml_metal {
 
     // the last command buffer queued into the Metal queue with operations relevant to the current Metal backend
     id<MTLCommandBuffer> cmd_buf_last;
+    id<MTLCommandBuffer> cmd_buf_main_end; // command buffer the main thread ended in (host ops split it)
+    bool has_host_ops;                     // the graph being encoded has host ops
 
     // abort ggml_metal_graph_compute if callback returns true
     ggml_abort_callback abort_callback;
@@ -497,6 +499,7 @@ enum ggml_status ggml_metal_graph_compute(ggml_metal_t ctx, struct ggml_cgraph *
         for (int i = 0; i < gf->n_nodes; ++i) {
             n_host += ggml_metal_host_op_is_registered(gf->nodes[i]);
         }
+        ctx->has_host_ops = n_host > 0;
         if (n_host > 0) {
             uint64_t v = ggml_metal_device_host_op_reserve(ctx->dev, n_host);
             for (int i = 0; i < gf->n_nodes; ++i) {
@@ -519,8 +522,9 @@ enum ggml_status ggml_metal_graph_compute(ggml_metal_t ctx, struct ggml_cgraph *
     @autoreleasepool {
         ctx->gf = gf;
 
-        if (ctx->n_cb == 0) {
+        if (ctx->n_cb == 0 || ctx->has_host_ops) {
             // single-threaded encoding: the whole graph is encoded by one command buffer
+            // (host ops split it into several, which must stay in node order)
             ctx->n_nodes_0      = gf->n_nodes;
             ctx->n_nodes_1      = 0;
             ctx->n_nodes_per_cb = 0;
@@ -587,7 +591,7 @@ enum ggml_status ggml_metal_graph_compute(ggml_metal_t ctx, struct ggml_cgraph *
         }
 
         // remember the command buffer for the next iteration
-        ctx->cmd_buf_last = ctx->cmd_bufs[n_cb].obj;
+        ctx->cmd_buf_last = ctx->cmd_buf_main_end ? ctx->cmd_buf_main_end : ctx->cmd_bufs[n_cb].obj;
 
         // prepare the rest of the command buffers asynchronously (optional)
         // cmd_buf[0.. n_cb)
@@ -784,11 +788,24 @@ void ggml_metal_set_n_cb(ggml_metal_t ctx, int n_cb) {
             idx += res - 1;
         }
 
+        // host ops end the command buffer and continue in a new one
+        id<MTLCommandBuffer> cmd_buf_end = (id<MTLCommandBuffer>) ggml_metal_op_cmd_buf(ctx_op);
+        const bool split = ggml_metal_op_n_host_split(ctx_op) > 0;
+
         ggml_metal_op_free(ctx_op);
 
-        if (cb_idx < 2 || ctx->abort_callback == NULL) {
-            [cmd_buf commit];
+        if (split) {
+            // the last command buffer of the split chain: released in synchronize
+            [ctx->cmd_bufs_ext addObject:cmd_buf_end];
         }
+        if (cb_idx == n_cb_l) {
+            ctx->cmd_buf_main_end = split ? cmd_buf_end : nil;
+        }
+
+        if (cb_idx < 2 || ctx->abort_callback == NULL || split) {
+            [cmd_buf_end commit];
+        }
+        GGML_UNUSED(cmd_buf);
     });
 }
 

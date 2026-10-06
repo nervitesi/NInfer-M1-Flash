@@ -106,7 +106,8 @@ struct ggml_metal_op {
 
     ggml_metal_device_t  dev;
     ggml_metal_library_t lib;
-    ggml_metal_cmd_buf_t cmd_buf;
+    ggml_metal_cmd_buf_t cmd_buf;      // current command buffer (changes at host ops)
+    int                  n_host_split = 0;
     ggml_metal_encoder_t enc;
     ggml_mem_ranges_t    mem_ranges;
 
@@ -154,6 +155,14 @@ ggml_metal_op_t ggml_metal_op_init(
 
 void ggml_metal_op_free(ggml_metal_op_t ctx) {
     delete ctx;
+}
+
+ggml_metal_cmd_buf_t ggml_metal_op_cmd_buf(ggml_metal_op_t ctx) {
+    return ctx->cmd_buf;
+}
+
+int ggml_metal_op_n_host_split(ggml_metal_op_t ctx) {
+    return ctx->n_host_split;
 }
 
 int ggml_metal_op_n_nodes(ggml_metal_op_t ctx) {
@@ -253,12 +262,14 @@ static int ggml_metal_op_encode_impl(ggml_metal_op_t ctx, int idx) {
         return 1;
     }
 
-    // host op: a CPU round trip inside the command stream, between two compute encoders
+    // host op: a CPU round trip between two command buffers
     if (ggml_metal_host_op_is_registered(node)) {
         ggml_metal_encoder_end_encoding(ctx->enc);
         ggml_metal_encoder_free(ctx->enc);
 
-        ggml_metal_device_encode_host_op(ctx->dev, ctx->cmd_buf, node);
+        // the first command buffer belongs to the context, the following ones to this encoding pass
+        ctx->cmd_buf = ggml_metal_device_encode_host_op(ctx->dev, ctx->cmd_buf, node, ctx->n_host_split > 0);
+        ctx->n_host_split++;
 
         ctx->enc = ggml_metal_encoder_init(ctx->cmd_buf, ctx->use_concurrency);
         if (ctx->mem_ranges) {

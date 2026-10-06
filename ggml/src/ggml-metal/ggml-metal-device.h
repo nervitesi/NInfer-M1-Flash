@@ -335,7 +335,10 @@ void ggml_metal_device_event_synchronize(ggml_metal_device_t dev, ggml_metal_eve
 void     ggml_metal_host_op_register(void * fun);
 bool     ggml_metal_host_op_is_registered(const struct ggml_tensor * op);
 uint64_t ggml_metal_device_host_op_reserve(ggml_metal_device_t dev, int n_ops); // first value of 2*n_ops
-void     ggml_metal_device_encode_host_op(ggml_metal_device_t dev, ggml_metal_cmd_buf_t cmd_buf, struct ggml_tensor * node);
+// encodes the CPU round trip of host op `node` at the end of cmd_buf, commits cmd_buf and returns a new, enqueued and
+// retained command buffer that starts by waiting for the reply. The command buffer boundary makes the GPU see what the
+// CPU wrote (inside one command buffer it may read stale cached data). Intermediate command buffers release themselves.
+ggml_metal_cmd_buf_t ggml_metal_device_encode_host_op(ggml_metal_device_t dev, ggml_metal_cmd_buf_t cmd_buf, struct ggml_tensor * node, bool release_cmd_buf);
 
 void ggml_metal_device_get_memory(ggml_metal_device_t dev, size_t * free, size_t * total);
 bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_tensor * op);

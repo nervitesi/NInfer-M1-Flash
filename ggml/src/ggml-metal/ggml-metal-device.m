@@ -1599,7 +1599,7 @@ static void ggml_metal_host_op_run(struct ggml_tensor * node) {
     }
 }
 
-void ggml_metal_device_encode_host_op(ggml_metal_device_t dev, ggml_metal_cmd_buf_t cmd_buf_raw, struct ggml_tensor * node) {
+ggml_metal_cmd_buf_t ggml_metal_device_encode_host_op(ggml_metal_device_t dev, ggml_metal_cmd_buf_t cmd_buf_raw, struct ggml_tensor * node, bool release_cmd_buf) {
     id<MTLCommandBuffer> cmd_buf = (id<MTLCommandBuffer>) cmd_buf_raw;
     id<MTLSharedEvent>   event   = dev->host_event;
 
@@ -1616,7 +1616,20 @@ void ggml_metal_device_encode_host_op(ggml_metal_device_t dev, ggml_metal_cmd_bu
     }];
 
     [cmd_buf encodeSignalEvent:event value:v];
-    [cmd_buf encodeWaitForEvent:event value:v + 1];
+    if (release_cmd_buf) {
+        // an intermediate command buffer of this graph: nothing else holds it
+        [cmd_buf addCompletedHandler:^(id<MTLCommandBuffer> cb) {
+            [cb release];
+        }];
+    }
+    [cmd_buf commit];
+
+    id<MTLCommandBuffer> next = [dev->mtl_queue commandBufferWithUnretainedReferences];
+    [next retain];
+    [next enqueue];
+    [next encodeWaitForEvent:event value:v + 1];
+
+    return (ggml_metal_cmd_buf_t) next;
 }
 
 void ggml_metal_device_get_memory(ggml_metal_device_t dev, size_t * free, size_t * total) {
