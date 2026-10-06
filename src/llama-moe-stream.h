@@ -301,6 +301,13 @@ void llama_moe_stream_remap_la(ggml_tensor * dst, const ggml_tensor * a, const g
 //   wave_ids:   make wave w's experts resident and emit slot ids (masked pairs park on a pool)
 //   wave_mask:  1.0 for pairs of wave w, 0.0 otherwise
 //   wave_pairs: same staging, but emit the index rows of wave w's dense pair list (partition path)
+// Per-graph wave plan (pair chunk, wave count, wave capacity), written into the wave ops' op_params at graph build
+// and read back by the ops. llama builds the next ubatch's graph while this one's host ops are still pending, so the
+// per-layer plan_* fields can already belong to a graph of another shape when an op runs (the short last ubatch of a
+// prompt; with 4096-token ubatches the planner then staged too few experts and a wave op aborted).
+// Bytes 32..47 of op_params: after ggml_custom_op_params (24 bytes), before the Metal host-op value at 48.
+void llama_moe_stream_set_plan(ggml_tensor * op, uint32_t pair_chunk, uint32_t waves_want, uint32_t capacity);
+
 void llama_moe_stream_wave_ids  (ggml_tensor * dst, int ith, int nth, void * userdata);
 void llama_moe_stream_wave_mask (ggml_tensor * dst, int ith, int nth, void * userdata);
 void llama_moe_stream_wave_pairs(ggml_tensor * dst, int ith, int nth, void * userdata);

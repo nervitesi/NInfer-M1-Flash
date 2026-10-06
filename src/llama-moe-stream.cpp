@@ -1418,8 +1418,17 @@ void llama_moe_stream::emit_wave_pairs(llama_moe_stream_layer & sl, const int32_
 
 // shared preamble of the wave ops: plan the ubatch on wave 0, enforce the wave order, and make wave
 // w resident while preloading the next. Returns with the mutex held for the emit that follows.
+static const size_t   LLAMA_MOE_STREAM_PLAN_OFFS  = 32;
+static const uint32_t LLAMA_MOE_STREAM_PLAN_MAGIC = 0x4e414c50; // "PLAN"
+
+void llama_moe_stream_set_plan(ggml_tensor * op, uint32_t pair_chunk, uint32_t waves_want, uint32_t capacity) {
+    static_assert(LLAMA_MOE_STREAM_PLAN_OFFS + 16 <= GGML_MAX_OP_PARAMS, "op_params too small for the wave plan");
+    const uint32_t v[4] = { pair_chunk, waves_want, capacity, LLAMA_MOE_STREAM_PLAN_MAGIC };
+    memcpy((char *) op->op_params + LLAMA_MOE_STREAM_PLAN_OFFS, v, sizeof(v));
+}
+
 static std::unique_lock<std::mutex> stage_wave_for_op(llama_moe_stream_layer & sl, int32_t w,
-        const int32_t * ids, int64_t n, uint32_t n_ids) {
+        const int32_t * ids, int64_t n, uint32_t n_ids, const ggml_tensor * dst) {
     auto * mgr = sl.mgr;
 
     std::unique_lock<std::mutex> lk(mgr->mtx);
@@ -1429,6 +1438,14 @@ static std::unique_lock<std::mutex> stage_wave_for_op(llama_moe_stream_layer & s
     }
 
     mgr->stats.n_wave_calls++;
+
+    // this graph's plan, not whatever graph was built last (see llama_moe_stream_set_plan)
+    uint32_t v[4];
+    memcpy(v, (const char *) dst->op_params + LLAMA_MOE_STREAM_PLAN_OFFS, sizeof(v));
+    GGML_ASSERT(v[3] == LLAMA_MOE_STREAM_PLAN_MAGIC && "wave op built without its plan");
+    sl.plan_pair_chunk = v[0];
+    sl.plan_waves_want = v[1];
+    sl.plan_capacity   = v[2];
 
     if (w == 0) {
         mgr->plan_waves_locked(sl, ids, n);
@@ -1465,7 +1482,7 @@ void llama_moe_stream_wave_ids(ggml_tensor * dst, int ith, int nth, void * userd
     const int32_t * ids = (const int32_t *) a->data;
           int32_t * out = (int32_t *) dst->data;
 
-    std::unique_lock<std::mutex> lk = stage_wave_for_op(*sl, w, ids, n, (uint32_t) a->ne[0]);
+    std::unique_lock<std::mutex> lk = stage_wave_for_op(*sl, w, ids, n, (uint32_t) a->ne[0], dst);
 
     mgr->emit_wave_slots(*sl, ids, out, w, (uint32_t) a->ne[0], a->ne[1]);
 
@@ -1501,7 +1518,7 @@ void llama_moe_stream_wave_pairs(ggml_tensor * dst, int ith, int nth, void * use
                 a->name, a->data, (void *) a->buffer, dst->name, dst->data, (void *) dst->buffer, (void *) a->view_src);
     }
 
-    std::unique_lock<std::mutex> lk = stage_wave_for_op(*sl, w, ids, n, (uint32_t) a->ne[0]);
+    std::unique_lock<std::mutex> lk = stage_wave_for_op(*sl, w, ids, n, (uint32_t) a->ne[0], dst);
 
     mgr->emit_wave_pairs(*sl, ids, out, w, (uint32_t) a->ne[0], n, dst->ne[0]);
 

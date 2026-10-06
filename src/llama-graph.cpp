@@ -2486,6 +2486,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
             ggml_tensor * pairs_w = ggml_custom_4d(ctx0, GGML_TYPE_I32,
                     chunk, LLAMA_MOE_PAIR_ROWS, 1, 1,
                     args, n_args, llama_moe_stream_wave_pairs, 1, msl->wave_userdata(w, stream_wave_cap));
+            llama_moe_stream_set_plan(pairs_w, (uint32_t) chunk, n_stream_waves, stream_wave_cap);
             cb(pairs_w, "ffn_moe_wave_pairs", il);
 
             auto row = [&](llama_moe_pair_row r) {
@@ -2528,6 +2529,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
             ggml_tensor * ids_w = ggml_custom_4d(ctx0, GGML_TYPE_I32,
                     ids_cont->ne[0], ids_cont->ne[1], 1, 1,
                     args, n_args, llama_moe_stream_wave_ids, 1, msl->wave_userdata(w, stream_wave_cap));
+            llama_moe_stream_set_plan(ids_w, 0, 0, stream_wave_cap);
             cb(ids_w, "ffn_moe_wave_ids", il);
 
             ggml_tensor * e_w = build_expert_gemms(cur, ids_w, selected_experts);
