@@ -11,6 +11,8 @@
 #include <Metal/Metal.h>
 
 #include <stdatomic.h>
+#include <pthread.h>
+#include <mach/mach_time.h>
 
 #ifndef TARGET_OS_VISION
 #define TARGET_OS_VISION 0
@@ -996,6 +998,7 @@ struct ggml_metal_device {
     // host ops: one shared event per device, values reserved in graph order
     id<MTLSharedEvent>       host_event;
     MTLSharedEventListener * host_listener;
+    struct ggml_metal_host_spin * host_spin; // GGML_METAL_HOST_SPIN: the replies come from a spinning thread
     atomic_uint_fast64_t     host_value;
 
     // Metal 4 submission, created on first use (see ggml_metal_mtl4_begin); completion values on host_event
@@ -1475,6 +1478,147 @@ ggml_metal_device_t ggml_metal_device_init(int device, int n_devices) {
     return dev;
 }
 
+//
+// host-op replies from a spinning thread
+//
+// MTLSharedEventListener runs the reply block ~30 us after the GPU signals (54 us per round trip against 22 us when
+// a CPU thread spins on signaledValue, tools/metal-sync-bench/gatebench). By default one thread
+// takes the host ops in the order they were encoded, spins until the GPU reaches each one, runs it and signals back.
+// It keeps one core busy while ops are pending and sleeps when the queue is empty; after 2 ms of spinning it falls
+// back to a blocking wait, so a long GPU segment or a stalled queue does not burn the core.
+
+#define GGML_METAL_HOST_SPIN_CAP 4096
+
+struct ggml_metal_host_spin {
+    ggml_metal_device_t dev;
+
+    pthread_t       thread;
+    pthread_mutex_t mtx;
+    pthread_cond_t  cond;
+    bool            stop;
+
+    // pending ops in encode order, which is the order the GPU reaches them
+    uint64_t             val [GGML_METAL_HOST_SPIN_CAP];
+    struct ggml_tensor * snap[GGML_METAL_HOST_SPIN_CAP];
+    int                  head;
+    int                  count;
+};
+
+static void ggml_metal_host_op_run(struct ggml_tensor * node);
+
+static void * ggml_metal_host_spin_main(void * arg) {
+    struct ggml_metal_host_spin * hs = (struct ggml_metal_host_spin *) arg;
+    id<MTLSharedEvent> event = hs->dev->host_event;
+
+    pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
+
+    mach_timebase_info_data_t tb;
+    mach_timebase_info(&tb);
+    const uint64_t spin_ticks = (uint64_t) (2e6 * tb.denom / tb.numer); // 2 ms
+
+    for (;;) {
+        pthread_mutex_lock(&hs->mtx);
+        while (hs->count == 0 && !hs->stop) {
+            pthread_cond_wait(&hs->cond, &hs->mtx);
+        }
+        if (hs->count == 0) { // stop
+            pthread_mutex_unlock(&hs->mtx);
+            break;
+        }
+        const uint64_t       v    = hs->val [hs->head];
+        struct ggml_tensor * snap = hs->snap[hs->head];
+        pthread_mutex_unlock(&hs->mtx);
+
+        bool ready = true;
+        const uint64_t t0 = mach_absolute_time();
+        while (event.signaledValue < v) {
+            if (mach_absolute_time() - t0 < spin_ticks) {
+                __asm__ __volatile__("yield");
+                continue;
+            }
+            [event waitUntilSignaledValue:v timeoutMS:100];
+            if (hs->stop && event.signaledValue < v) {
+                ready = false; // shutting down and the GPU never got here
+                break;
+            }
+        }
+
+        if (ready) {
+            ggml_metal_host_op_run(&snap[0]);
+            event.signaledValue = v + 1;
+        }
+        free(snap);
+
+        pthread_mutex_lock(&hs->mtx);
+        hs->head = (hs->head + 1) % GGML_METAL_HOST_SPIN_CAP;
+        hs->count--;
+        pthread_mutex_unlock(&hs->mtx);
+    }
+
+    return NULL;
+}
+
+// on by default; GGML_METAL_HOST_SPIN=0 goes back to the listener
+static bool ggml_metal_host_spin_enabled(void) {
+    static int enabled = -1;
+    if (enabled < 0) {
+        const char * s = getenv("GGML_METAL_HOST_SPIN");
+        enabled = !s || atoi(s) != 0;
+    }
+    return enabled != 0;
+}
+
+// queue the reply to host op value v; returns false when the spinning thread is not used
+static bool ggml_metal_host_spin_submit(ggml_metal_device_t dev, uint64_t v, struct ggml_tensor * snap) {
+    if (!ggml_metal_host_spin_enabled()) {
+        return false;
+    }
+
+    if (dev->host_spin == NULL) {
+        struct ggml_metal_host_spin * hs = calloc(1, sizeof(struct ggml_metal_host_spin));
+        hs->dev = dev;
+        pthread_mutex_init(&hs->mtx, NULL);
+        pthread_cond_init(&hs->cond, NULL);
+        if (pthread_create(&hs->thread, NULL, ggml_metal_host_spin_main, hs) != 0) {
+            GGML_ABORT("%s: failed to start the host-op thread\n", __func__);
+        }
+        dev->host_spin = hs;
+    }
+
+    struct ggml_metal_host_spin * hs = dev->host_spin;
+
+    pthread_mutex_lock(&hs->mtx);
+    GGML_ASSERT(hs->count < GGML_METAL_HOST_SPIN_CAP && "too many host ops in flight");
+    if (hs->count > 0) {
+        const int last = (hs->head + hs->count - 1) % GGML_METAL_HOST_SPIN_CAP;
+        GGML_ASSERT(hs->val[last] < v && "host ops must be queued in value order");
+    }
+    const int tail = (hs->head + hs->count) % GGML_METAL_HOST_SPIN_CAP;
+    hs->val [tail] = v;
+    hs->snap[tail] = snap;
+    hs->count++;
+    pthread_cond_signal(&hs->cond);
+    pthread_mutex_unlock(&hs->mtx);
+
+    return true;
+}
+
+static void ggml_metal_host_spin_free(ggml_metal_device_t dev) {
+    struct ggml_metal_host_spin * hs = dev->host_spin;
+    if (hs == NULL) {
+        return;
+    }
+    pthread_mutex_lock(&hs->mtx);
+    hs->stop = true;
+    pthread_cond_signal(&hs->cond);
+    pthread_mutex_unlock(&hs->mtx);
+    pthread_join(hs->thread, NULL);
+    pthread_mutex_destroy(&hs->mtx);
+    pthread_cond_destroy(&hs->cond);
+    free(hs);
+    dev->host_spin = NULL;
+}
+
 void ggml_metal_device_free(ggml_metal_device_t dev) {
     assert(dev != NULL);
 
@@ -1506,6 +1650,8 @@ void ggml_metal_device_free(ggml_metal_device_t dev) {
         }
         [dev->m4_lock release];
         [dev->m4_graph_lock release];
+
+        ggml_metal_host_spin_free(dev);
 
         if (dev->host_listener) {
             [dev->host_listener release];
@@ -1753,12 +1899,14 @@ ggml_metal_cmd_buf_t ggml_metal_device_encode_host_op(ggml_metal_device_t dev, g
 
     // registered before the command buffer is committed, so the signal cannot be missed; the reply
     // must always be sent, the GPU is blocked on it
-    [event notifyListener:dev->host_listener atValue:v block:^(id<MTLSharedEvent> e, uint64_t value) {
-        GGML_UNUSED(value);
-        ggml_metal_host_op_run(&snap[0]);
-        free(snap);
-        e.signaledValue = v + 1;
-    }];
+    if (!ggml_metal_host_spin_submit(dev, v, snap)) {
+        [event notifyListener:dev->host_listener atValue:v block:^(id<MTLSharedEvent> e, uint64_t value) {
+            GGML_UNUSED(value);
+            ggml_metal_host_op_run(&snap[0]);
+            free(snap);
+            e.signaledValue = v + 1;
+        }];
+    }
 
     [cmd_buf encodeSignalEvent:event value:v];
     if (release_cmd_buf) {
@@ -2022,12 +2170,14 @@ ggml_metal_encoder_t ggml_metal_mtl4_host_op(ggml_metal_mtl4_t m4, struct ggml_t
     }
 
     // registered before the commit, so the signal cannot be missed; the reply must always be sent
-    [event notifyListener:dev->host_listener atValue:v block:^(id<MTLSharedEvent> e, uint64_t value) {
-        GGML_UNUSED(value);
-        ggml_metal_host_op_run(&snap[0]);
-        free(snap);
-        e.signaledValue = v + 1;
-    }];
+    if (!ggml_metal_host_spin_submit(dev, v, snap)) {
+        [event notifyListener:dev->host_listener atValue:v block:^(id<MTLSharedEvent> e, uint64_t value) {
+            GGML_UNUSED(value);
+            ggml_metal_host_op_run(&snap[0]);
+            free(snap);
+            e.signaledValue = v + 1;
+        }];
+    }
 
     ggml_metal_mtl4_commit_cb(m4, v);
     [(id<MTL4CommandQueue>) dev->q4 waitForEvent:event value:v + 1];
