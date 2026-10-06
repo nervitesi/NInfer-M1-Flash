@@ -327,6 +327,16 @@ ggml_metal_event_t ggml_metal_device_event_init(ggml_metal_device_t dev);
 void ggml_metal_device_event_free(ggml_metal_device_t dev, ggml_metal_event_t ev);
 void ggml_metal_device_event_synchronize(ggml_metal_device_t dev, ggml_metal_event_t ev);
 
+// host ops: custom ops (GGML_OP_MAP_CUSTOM1/2, GGML_OP_CUSTOM) whose function is registered run on the CPU
+// inside the Metal command stream instead of splitting the graph. The GPU signals event value v, the CPU
+// runs the op on the node's host-visible tensors and signals v + 1, which the GPU waits for.
+#define GGML_METAL_HOST_OP_VALUE_OFFS 48 // byte offset of the event value in op_params, set per graph
+
+void     ggml_metal_host_op_register(void * fun);
+bool     ggml_metal_host_op_is_registered(const struct ggml_tensor * op);
+uint64_t ggml_metal_device_host_op_reserve(ggml_metal_device_t dev, int n_ops); // first value of 2*n_ops
+void     ggml_metal_device_encode_host_op(ggml_metal_device_t dev, ggml_metal_cmd_buf_t cmd_buf, struct ggml_tensor * node);
+
 void ggml_metal_device_get_memory(ggml_metal_device_t dev, size_t * free, size_t * total);
 bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_tensor * op);
 

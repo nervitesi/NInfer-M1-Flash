@@ -54,6 +54,11 @@ GGML_BACKEND_API bool ggml_backend_metal_supports_family(ggml_backend_t backend,
 // capture all command buffers committed the next time `ggml_backend_graph_compute` is called
 GGML_BACKEND_API void ggml_backend_metal_capture_next_compute(ggml_backend_t backend);
 
+// Run the custom op with this function (ggml_map_custom1/2, ggml_custom_4d) on the CPU inside the Metal command
+// stream: the GPU waits on a shared event while the CPU runs the op on the node's tensors, so the op does not split
+// the graph. Requires shared (unified memory) buffers; the op is called with ith = 0, nth = 1.
+GGML_BACKEND_API void ggml_backend_metal_register_host_op(void * fun);
+
 GGML_BACKEND_API ggml_backend_reg_t ggml_backend_metal_reg(void);
 
 #ifdef __cplusplus

@@ -490,6 +490,25 @@ enum ggml_status ggml_metal_graph_compute(ggml_metal_t ctx, struct ggml_cgraph *
     // keep the memory wired
     ggml_metal_device_rsets_keep_alive(ctx->dev);
 
+    // host ops get their event values in graph order: the command buffers are encoded in parallel but
+    // run in order, and the values must grow along the execution
+    {
+        int n_host = 0;
+        for (int i = 0; i < gf->n_nodes; ++i) {
+            n_host += ggml_metal_host_op_is_registered(gf->nodes[i]);
+        }
+        if (n_host > 0) {
+            uint64_t v = ggml_metal_device_host_op_reserve(ctx->dev, n_host);
+            for (int i = 0; i < gf->n_nodes; ++i) {
+                struct ggml_tensor * node = gf->nodes[i];
+                if (ggml_metal_host_op_is_registered(node)) {
+                    memcpy((char *) node->op_params + GGML_METAL_HOST_OP_VALUE_OFFS, &v, sizeof(v));
+                    v += 2;
+                }
+            }
+        }
+    }
+
     // submit the ggml compute graph to the GPU by creating command buffers and encoding the ops in them
     // the first n_nodes_0 are encoded and submitted for processing directly by the calling thread
     // while these nodes are processing, we start n_cb threads to enqueue the rest of the nodes

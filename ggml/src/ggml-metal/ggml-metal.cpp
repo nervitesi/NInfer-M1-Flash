@@ -177,6 +177,7 @@ static ggml_backend_buffer_i ggml_backend_metal_buffer_private_i = {
     /* .cpy_tensor    = */ ggml_backend_metal_buffer_private_cpy_tensor,
     /* .clear         = */ ggml_backend_metal_buffer_private_clear,
     /* .reset         = */ NULL,
+    /* .get_host_ptr  = */ NULL,
 };
 
 static bool ggml_backend_buffer_is_metal(ggml_backend_buffer_t buffer) {
@@ -628,6 +629,10 @@ ggml_backend_t ggml_backend_metal_init(void) {
     ggml_backend_metal_set_n_cb(backend, 1);
 
     return backend;
+}
+
+void ggml_backend_metal_register_host_op(void * fun) {
+    ggml_metal_host_op_register(fun);
 }
 
 bool ggml_backend_is_metal(ggml_backend_t backend) {

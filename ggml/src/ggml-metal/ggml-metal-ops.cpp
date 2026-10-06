@@ -46,6 +46,7 @@ struct ggml_metal_op {
         int  debug_graph) {
         this->dev             = dev;
         this->lib             = ggml_metal_device_get_library(dev);
+        this->cmd_buf         = cmd_buf;
         this->enc             = ggml_metal_encoder_init(cmd_buf, use_concurrency);
         this->mem_ranges      = ggml_mem_ranges_init(debug_graph);
         this->finfo           = finfo;
@@ -105,6 +106,7 @@ struct ggml_metal_op {
 
     ggml_metal_device_t  dev;
     ggml_metal_library_t lib;
+    ggml_metal_cmd_buf_t cmd_buf;
     ggml_metal_encoder_t enc;
     ggml_mem_ranges_t    mem_ranges;
 
@@ -248,6 +250,20 @@ static int ggml_metal_op_encode_impl(ggml_metal_op_t ctx, int idx) {
     }
 
     if ((node->flags & GGML_TENSOR_FLAG_COMPUTE) == 0) {
+        return 1;
+    }
+
+    // host op: a CPU round trip inside the command stream, between two compute encoders
+    if (ggml_metal_host_op_is_registered(node)) {
+        ggml_metal_encoder_end_encoding(ctx->enc);
+        ggml_metal_encoder_free(ctx->enc);
+
+        ggml_metal_device_encode_host_op(ctx->dev, ctx->cmd_buf, node);
+
+        ctx->enc = ggml_metal_encoder_init(ctx->cmd_buf, ctx->use_concurrency);
+        if (ctx->mem_ranges) {
+            ggml_mem_ranges_reset(ctx->mem_ranges);
+        }
         return 1;
     }
 

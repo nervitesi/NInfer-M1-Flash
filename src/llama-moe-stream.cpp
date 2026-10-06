@@ -182,6 +182,21 @@ llama_moe_stream::llama_moe_stream(uint32_t n_layer, uint32_t n_slots, int32_t n
         stats_dump_us = std::max<int64_t>(0, std::atoll(s))*1000;
     }
 
+#ifdef GGML_USE_METAL
+    // on Metal the remap and wave ops run as host ops inside the command stream instead of splitting
+    // the graph at every streamed layer (LLAMA_MOE_STREAM_HOST_OPS=0 keeps the CPU splits)
+    {
+        const char * e = std::getenv("LLAMA_MOE_STREAM_HOST_OPS");
+        if (!e || atoi(e) != 0) {
+            ggml_backend_metal_register_host_op((void *) llama_moe_stream_remap);
+            ggml_backend_metal_register_host_op((void *) llama_moe_stream_remap_la);
+            ggml_backend_metal_register_host_op((void *) llama_moe_stream_wave_ids);
+            ggml_backend_metal_register_host_op((void *) llama_moe_stream_wave_mask);
+            ggml_backend_metal_register_host_op((void *) llama_moe_stream_wave_pairs);
+        }
+    }
+#endif
+
     // keep every reader busy a few slabs deep, but no deeper
     q_spec_max = (size_t) this->n_io_threads * 8;
     if (const char * s = std::getenv("LLAMA_MOE_STREAM_SPEC_MAX")) {
