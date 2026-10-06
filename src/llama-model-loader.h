@@ -70,6 +70,7 @@ struct llama_model_loader {
     static const int TENSOR_SKIP_IF_VIRTUAL = 1 << 3;
     static const int TENSOR_ALLOW_RESHAPE   = 1 << 4;
     static const int TENSOR_READ_LAZY       = 1 << 5; // read rows on demand instead of loading whole tensor; requires mmap for now
+    static const int TENSOR_STREAMED        = 1 << 6; // MoE expert streaming owns this tensor's I/O; do not load or allocate it
 
     int n_kv      = 0;
     int n_tensors = 0;
@@ -118,6 +119,7 @@ struct llama_model_loader {
     } lazy;
 
     llama_files files;
+    std::vector<std::string> file_paths; // same order as files; empty for FILE*-based loading
     llama_ftype ftype;
     llama_fver  fver;
 
@@ -237,6 +239,10 @@ struct llama_model_loader {
     struct ggml_tensor * create_tensor(
         const llama_hparams & hparams, const buft_list_t * buft_list_cpu, const buft_list_t * buft_list_input, const buft_list_t * buft_list_output,
         const buft_list_t * buft_list_layer, const LLM_TN_IMPL & tn, const std::initializer_list<int64_t> & ne, int flags);
+
+    // buffer type for a MoE expert streaming cache: only the devices' default buffer types, because
+    // extra buffer types (e.g. CPU repacking) may not support the slot-wise partial writes
+    static ggml_backend_buffer_type_t select_stream_buft(const llama_hparams & hparams, ggml_tensor * meta, const buft_list_t * buft_list);
 
     void done_getting_tensors(bool partial = false) const;
 

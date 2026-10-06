@@ -9,6 +9,7 @@
 #include "llama-memory.h"
 #include "llama-mmap.h"
 #include "llama-model.h"
+#include "llama-moe-stream.h"
 #include "llama-ext.h"
 #include "llama-sampler.h"
 #include "llama.h"
@@ -2408,6 +2409,16 @@ uint32_t llama_context::graph_max_nodes(uint32_t n_tokens) const {
     if (n_sampling_outputs_max > 1) {
         res += (n_sampling_outputs_max - 1) * n_sampling_nodes_max;
     }
+
+    if (const auto * mstream = model.moe_stream()) {
+        // multi-pass streamed prefill adds a bounded number of nodes per wave and streamed layer
+        const uint32_t n_eu = model.hparams.n_expert_used_max();
+        uint32_t cap = mstream->n_slots > n_eu ? (mstream->n_slots - n_eu)/2 : 0;
+        cap = std::max<uint32_t>(cap, 1);
+        const uint32_t n_touch_max = std::min<uint32_t>(model.hparams.n_expert, n_tokens*n_eu);
+        const uint32_t n_waves = (n_touch_max + cap - 1)/cap + 1; // +1: the cap-1 wave sizing
+        res += 24u*n_waves*(uint32_t) mstream->layers.size();
+    }
     return res;
 }
 
@@ -2557,6 +2568,7 @@ llm_graph_params llama_context::graph_params(
         /*.cross       =*/ &cross,
         /*.prec_policy =*/ &model.prec_policy,
         /*.samplers    =*/ sampling.samplers,
+        /*.mstream     =*/ model.moe_stream(),
         /*.n_outputs   =*/ n_outputs,
         /*.cb          =*/ graph_get_cb(),
         /*.res         =*/ res,
@@ -4386,6 +4398,8 @@ void llama_perf_context_print(const llama_context * ctx) {
             __func__, data.t_eval_ms, data.n_eval, data.t_eval_ms / data.n_eval, 1e3 / data.t_eval_ms * data.n_eval);
     LLAMA_LOG_INFO("%s:       total time = %10.2f ms / %5d tokens\n", __func__, (t_end_ms - data.t_start_ms), (data.n_p_eval + data.n_eval));
     LLAMA_LOG_INFO("%s:    graphs reused = %10d\n", __func__, data.n_reused);
+
+    llama_model_moe_stream_print_stats(&ctx->get_model());
 }
 
 void llama_perf_context_reset(llama_context * ctx) {

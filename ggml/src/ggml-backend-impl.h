@@ -64,6 +64,8 @@ extern "C" {
         void         (*clear)        (ggml_backend_buffer_t buffer, uint8_t value);
         // (optional) reset any internal state due to tensor initialization, such as tensor extras
         void         (*reset)        (ggml_backend_buffer_t buffer);
+        // (optional) base address the CPU can read and write directly (e.g. unified memory), or NULL
+        void *       (*get_host_ptr) (ggml_backend_buffer_t buffer);
     };
 
     struct ggml_backend_buffer {

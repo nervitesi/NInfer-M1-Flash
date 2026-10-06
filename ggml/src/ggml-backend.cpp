@@ -406,6 +406,19 @@ void ggml_backend_tensor_get_2d(const struct ggml_tensor * tensor, void * data, 
     buf->iface.get_tensor_2d(buf, tensor, data, offset, size, n_copies, stride_tensor, stride_data);
 }
 
+void * ggml_backend_tensor_get_host_ptr(const struct ggml_tensor * tensor) {
+    if (tensor == NULL || tensor->buffer == NULL || tensor->data == NULL) {
+        return NULL;
+    }
+    if (ggml_backend_buffer_is_host(tensor->buffer)) {
+        return tensor->data;
+    }
+    if (tensor->buffer->iface.get_host_ptr == NULL || tensor->buffer->iface.get_host_ptr(tensor->buffer) == NULL) {
+        return NULL;
+    }
+    return tensor->data;
+}
+
 void ggml_backend_tensor_memset(struct ggml_tensor * tensor, uint8_t value, size_t offset, size_t size) {
     GGML_ASSERT(tensor);
     ggml_backend_buffer_t buf = tensor->view_src ? tensor->view_src->buffer : tensor->buffer;

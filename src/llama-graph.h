@@ -792,6 +792,9 @@ struct llm_graph_params {
 
     std::map<llama_seq_id, llama_sampler *> samplers;
 
+    // MoE expert streaming state of the model, null when not streamed
+    struct llama_moe_stream * mstream = nullptr;
+
     static bool samplers_equal(
           const std::map<llama_seq_id, llama_sampler *> & lhs,
           const std::map<llama_seq_id, llama_sampler *> & rhs) {
@@ -1034,6 +1037,8 @@ struct llm_graph_context {
 
     std::map<llama_seq_id, llama_sampler *> samplers;
 
+    struct llama_moe_stream * mstream;
+
     const llm_graph_cb & cb_func;
 
     llm_graph_result * res;
@@ -1061,11 +1066,13 @@ struct llm_graph_context {
               ggml_tensor * w_s = nullptr) const;
 
     // do mat_mul_id, while optionally apply lora and per-expert scale
+    // ids_exp: the original expert ids for w_s and the LoRA weights, when ids are expert cache slots
     ggml_tensor * build_lora_mm_id(
               ggml_tensor * w,   // ggml_tensor * as
               ggml_tensor * cur, // ggml_tensor * b
               ggml_tensor * ids,
-              ggml_tensor * w_s = nullptr) const;
+              ggml_tensor * w_s = nullptr,
+              ggml_tensor * ids_exp = nullptr) const;
 
     ggml_tensor * build_norm(
              ggml_tensor * cur,

@@ -346,13 +346,21 @@ extern "C" {
         // override key-value pairs of the model meta data
         const struct llama_model_kv_override * kv_overrides;
 
+        // MoE expert streaming (moe_stream): routed expert weights stay on disk and are read on demand
+        // into a cache of expert slots per layer
+        uint64_t moe_stream_budget;     // expert cache size in bytes, used when moe_stream_slots is 0
+        uint32_t moe_stream_slots;      // expert cache slots per layer (0 = from moe_stream_budget)
+        int32_t  moe_stream_io_threads; // I/O threads for expert reads (<= 0 = default)
+
         // Keep the booleans together to avoid misalignment during copy-by-value.
-        bool vocab_only;      // only load the vocabulary, no weights
-        bool check_tensors;   // validate model tensor data
-        bool use_extra_bufts; // use extra buffer types (used for weight repacking)
-        bool no_host;         // bypass host buffer allowing extra buffers to be used
-        bool no_alloc;        // only load metadata and simulate memory allocations
-        bool load_mtp;        // whether to load MTP layers
+        bool vocab_only;        // only load the vocabulary, no weights
+        bool check_tensors;     // validate model tensor data
+        bool use_extra_bufts;   // use extra buffer types (used for weight repacking)
+        bool no_host;           // bypass host buffer allowing extra buffers to be used
+        bool no_alloc;          // only load metadata and simulate memory allocations
+        bool load_mtp;          // whether to load MTP layers
+        bool moe_stream;        // stream routed MoE expert weights from disk
+        bool moe_stream_direct; // read experts with F_NOCACHE/O_DIRECT (bypass the page cache)
     };
 
     struct llama_sampler_seq_config {
@@ -545,6 +553,9 @@ extern "C" {
             "use llama_model_free instead");
 
     LLAMA_API void llama_model_free(struct llama_model * model);
+
+    // print MoE expert streaming statistics (no-op when the model is not streamed)
+    LLAMA_API void llama_model_moe_stream_print_stats(const struct llama_model * model);
 
     LLAMA_API struct llama_context * llama_init_from_model(
                      struct llama_model * model,

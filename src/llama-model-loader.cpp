@@ -577,6 +577,7 @@ llama_model_loader::llama_model_loader(
         llm_kv = LLM_KV(llm_arch_from_string(arch_name));
 
         files.emplace_back(new llama_file(fname.c_str(), "rb", use_direct_io));
+        file_paths.emplace_back(fname);
         contexts.emplace_back(ctx);
 
         // Save tensors data offset of the main file.
@@ -645,6 +646,7 @@ llama_model_loader::llama_model_loader(
                 }
 
                 files.emplace_back(new llama_file(fname_split, "rb", use_direct_io));
+                file_paths.emplace_back(fname_split);
                 contexts.emplace_back(ctx);
 
                 // Save tensors data offset info of the shard.
@@ -696,6 +698,7 @@ llama_model_loader::llama_model_loader(
         llm_kv = LLM_KV(llm_arch_from_string(arch_name));
 
         files.emplace_back(new llama_file(file));
+        file_paths.emplace_back();
         contexts.emplace_back(ctx);
 
         // Save tensors data offset info of the main file.
@@ -1174,10 +1177,14 @@ struct ggml_tensor * llama_model_loader::create_tensor(
             throw std::runtime_error(format("missing tensor info mapping for %s", tn.str().c_str()));
         }
 
-        // skip unused tensors
-        if (info.op == GGML_OP_NONE || (flags & TENSOR_SKIP)) {
+        // skip unused tensors, and the routed experts that MoE expert streaming reads itself
+        if (info.op == GGML_OP_NONE || (flags & (TENSOR_SKIP | TENSOR_STREAMED))) {
             const size_t nbytes = ggml_nbytes(t_meta);
-            LLAMA_LOG_WARN("model has unused tensor %s (size = %zu bytes) -- ignoring\n", tn.str().c_str(), nbytes);
+            if (flags & TENSOR_STREAMED) {
+                LLAMA_LOG_DEBUG("tensor %s is streamed from disk (size = %zu bytes)\n", tn.str().c_str(), nbytes);
+            } else {
+                LLAMA_LOG_WARN("model has unused tensor %s (size = %zu bytes) -- ignoring\n", tn.str().c_str(), nbytes);
+            }
 
             size_data -= nbytes;
             n_created++;
@@ -1387,6 +1394,18 @@ struct ggml_tensor * llama_model_loader::create_tensor(
     }
 
     return tensor;
+}
+
+ggml_backend_buffer_type_t llama_model_loader::select_stream_buft(const llama_hparams & hparams, ggml_tensor * meta, const buft_list_t * buft_list) {
+    for (const auto & [dev, buft] : *buft_list) {
+        if (buft != ggml_backend_dev_buffer_type(dev)) {
+            continue;
+        }
+        if (weight_buft_supported(hparams, meta, GGML_OP_MUL_MAT_ID, buft, dev)) {
+            return buft;
+        }
+    }
+    return select_weight_buft(hparams, meta, GGML_OP_MUL_MAT_ID, buft_list);
 }
 
 void llama_model_loader::done_getting_tensors(bool partial) const {

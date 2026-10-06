@@ -2542,6 +2542,9 @@ common_params common_base_params_to_speculative(const common_params & params) {
         result.n_gpu_layers          = params_spec.n_gpu_layers;
         result.tensor_buft_overrides = params_spec.tensor_buft_overrides;
 
+        // a separate draft model is small: keep its experts in memory
+        result.moe_stream            = false;
+
         // a draft pinned to a single device doesn't need the meta wrapper an inherited -sm tensor would give it
         // (the device list is null-terminated, so a single device means size 2)
         const size_t n_devs = std::count_if(params_spec.devices.begin(), params_spec.devices.end(),

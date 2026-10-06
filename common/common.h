@@ -583,6 +583,13 @@ struct common_params {
     bool no_extra_bufts    = false; // disable extra buffer types (used for weight repacking)
     bool no_host           = false; // bypass host buffer allowing extra buffers to be used
 
+    // MoE expert streaming: routed experts stay on disk, read on demand into a cache of expert slots
+    bool     moe_stream            = false; // stream routed expert weights from disk
+    bool     moe_stream_direct     = false; // F_NOCACHE/O_DIRECT expert reads
+    uint64_t moe_stream_budget     = 0;     // expert cache size in bytes (used when moe_stream_slots is 0)
+    uint32_t moe_stream_slots      = 0;     // expert cache slots per layer (0 = from the budget)
+    int32_t  moe_stream_io_threads = 0;     // I/O threads for expert reads (<= 0 = default)
+
     bool single_turn       = false; // single turn chat conversation
 
     ggml_type cache_type_k = GGML_TYPE_F16; // KV cache data type for the K

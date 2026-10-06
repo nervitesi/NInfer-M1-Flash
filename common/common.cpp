@@ -1646,6 +1646,12 @@ struct llama_model_params common_model_params_to_llama(common_params & params) {
     mparams.use_extra_bufts = !params.no_extra_bufts;
     mparams.no_host         = params.no_host;
 
+    mparams.moe_stream            = params.moe_stream;
+    mparams.moe_stream_direct     = params.moe_stream_direct;
+    mparams.moe_stream_budget     = params.moe_stream_budget;
+    mparams.moe_stream_slots      = params.moe_stream_slots;
+    mparams.moe_stream_io_threads = params.moe_stream_io_threads;
+
     if (params.kv_overrides.empty()) {
         mparams.kv_overrides = NULL;
     } else {

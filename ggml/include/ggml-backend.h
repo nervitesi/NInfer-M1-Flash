@@ -95,6 +95,10 @@ extern "C" {
     GGML_API void ggml_backend_tensor_get_2d(const struct ggml_tensor * tensor,       void * data, size_t offset, size_t size, size_t n_copies, size_t stride_tensor, size_t stride_data);
     GGML_API void ggml_backend_tensor_memset(      struct ggml_tensor * tensor,     uint8_t value, size_t offset, size_t size);
 
+    // host pointer to the tensor data when the CPU can access its buffer directly (host buffers, unified
+    // memory), NULL otherwise
+    GGML_API void * ggml_backend_tensor_get_host_ptr(const struct ggml_tensor * tensor);
+
     GGML_API void ggml_backend_synchronize(ggml_backend_t backend);
 
     GGML_API ggml_backend_graph_plan_t ggml_backend_graph_plan_create(ggml_backend_t backend, struct ggml_cgraph * cgraph);

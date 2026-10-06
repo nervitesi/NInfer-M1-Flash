@@ -2439,6 +2439,54 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_NO_HOST"));
     add_opt(common_arg(
+        {"--moe-stream"},
+        "stream the routed MoE expert weights from disk into an expert cache instead of loading them",
+        [](common_params & params) {
+            params.moe_stream = true;
+        }
+    ).set_env("LLAMA_ARG_MOE_STREAM"));
+    add_opt(common_arg(
+        {"--moe-stream-cache"}, "NG|Ns",
+        "expert cache for --moe-stream: size in GiB (e.g. 40) or slots per layer with an s suffix (e.g. 336s); implies --moe-stream",
+        [](common_params & params, const std::string & value) {
+            if (value.empty()) {
+                throw std::invalid_argument("empty value");
+            }
+            if (value.back() == 's' || value.back() == 'S') {
+                const long n = std::stol(value.substr(0, value.size() - 1));
+                if (n <= 0) {
+                    throw std::invalid_argument("invalid slot count");
+                }
+                params.moe_stream_slots  = (uint32_t) n;
+                params.moe_stream_budget = 0;
+            } else {
+                const double gib = std::stod(value);
+                if (!(gib > 0.0)) {
+                    throw std::invalid_argument("invalid cache size");
+                }
+                params.moe_stream_budget = (uint64_t) (gib*1024.0*1024.0*1024.0);
+                params.moe_stream_slots  = 0;
+            }
+            params.moe_stream = true;
+        }
+    ).set_env("LLAMA_ARG_MOE_STREAM_CACHE"));
+    add_opt(common_arg(
+        {"--moe-stream-io-threads"}, "N",
+        "I/O threads for --moe-stream expert reads (default: 9); implies --moe-stream",
+        [](common_params & params, int value) {
+            params.moe_stream_io_threads = value;
+            params.moe_stream = true;
+        }
+    ).set_env("LLAMA_ARG_MOE_STREAM_IO_THREADS"));
+    add_opt(common_arg(
+        {"--moe-stream-direct"},
+        "read the streamed experts with F_NOCACHE/O_DIRECT, bypassing the page cache; implies --moe-stream",
+        [](common_params & params) {
+            params.moe_stream_direct = true;
+            params.moe_stream = true;
+        }
+    ).set_env("LLAMA_ARG_MOE_STREAM_DIRECT"));
+    add_opt(common_arg(
         {"-ctk", "--cache-type-k"}, "TYPE",
         string_format(
             "KV cache data type for K\n"
