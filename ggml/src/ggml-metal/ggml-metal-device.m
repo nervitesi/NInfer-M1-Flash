@@ -2716,6 +2716,42 @@ static void * ggml_metal_host_malloc(size_t n) {
     return data;
 }
 
+// NInfer-M1: upper limit for the Metal buffers of the process. On 2026-10-06 an M1 Max 64 GB panicked with 51 GiB of
+// Metal buffers (54.3 GiB wired, 123 MiB free): the GPU driver got kIOReturnNoMemory and crashed the kernel. Allocations
+// beyond the limit fail cleanly instead. GGML_METAL_MAX_ALLOC_GB sets it (0 disables); default physical memory - 14 GiB.
+static size_t ggml_metal_alloc_limit(void) {
+    static size_t limit = 0;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        const char * s = getenv("GGML_METAL_MAX_ALLOC_GB");
+        if (s) {
+            limit = (size_t) (atof(s) * 1024.0 * 1024.0 * 1024.0);
+        } else {
+            const uint64_t ram = [[NSProcessInfo processInfo] physicalMemory];
+            limit = ram > (28ull << 30) ? (size_t) (ram - (14ull << 30)) : (size_t) (ram / 2);
+        }
+    });
+    return limit;
+}
+
+static bool ggml_metal_alloc_allowed(id<MTLDevice> device, size_t size, const char * what) {
+    const size_t limit = ggml_metal_alloc_limit();
+    const size_t cur   = device.currentAllocatedSize;
+
+    if (limit > 0 && cur + size > limit) {
+        GGML_LOG_ERROR("%s: refusing to allocate %.2f MiB (%s): %.2f GiB of Metal buffers already allocated, limit %.2f GiB "
+                "(GGML_METAL_MAX_ALLOC_GB). Above it the GPU driver can run out of wired memory and panic the kernel; "
+                "reduce the context, the ubatch or the expert cache.\n",
+                __func__, size/1024.0/1024.0, what, cur/1024.0/1024.0/1024.0, limit/1024.0/1024.0/1024.0);
+        return false;
+    }
+    if (size >= (512ull << 20)) {
+        GGML_LOG_INFO("%s: %s of %.2f MiB, Metal buffers %.2f GiB of %.2f GiB allowed\n",
+                __func__, what, size/1024.0/1024.0, (cur + size)/1024.0/1024.0/1024.0, limit/1024.0/1024.0/1024.0);
+    }
+    return true;
+}
+
 ggml_metal_buffer_t ggml_metal_buffer_init(ggml_metal_device_t dev, size_t size, bool shared) {
     ggml_metal_buffer_t res = calloc(1, sizeof(struct ggml_metal_buffer));
 
@@ -2729,6 +2765,11 @@ ggml_metal_buffer_t ggml_metal_buffer_init(ggml_metal_device_t dev, size_t size,
     }
 
     const struct ggml_metal_device_props * props_dev = ggml_metal_device_get_props(dev);
+
+    if (!ggml_metal_alloc_allowed(dev->mtl_device, size_aligned, "buffer")) {
+        free(res);
+        return NULL;
+    }
 
     shared = shared && props_dev->use_shared_buffers;
 
@@ -2814,6 +2855,12 @@ ggml_metal_buffer_t ggml_metal_buffer_map(ggml_metal_device_t dev, void * ptr, s
     }
 
     const struct ggml_metal_device_props * props_dev = ggml_metal_device_get_props(dev);
+
+    // mapped file pages count too: residency wires them
+    if (!ggml_metal_alloc_allowed(dev->mtl_device, size_aligned, "mapped buffer")) {
+        free(res);
+        return NULL;
+    }
 
     // the buffer fits into the max buffer size allowed by the device
     if (size_aligned <= props_dev->max_buffer_size) {
