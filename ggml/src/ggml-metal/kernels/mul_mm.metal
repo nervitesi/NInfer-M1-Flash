@@ -360,6 +360,56 @@ kernel void kernel_mul_mm(
 
 #endif // GGML_METAL_HAS_TENSOR
 
+// map0 in two parallel steps, one thread per token instead of one thread per expert over all tokens (that one
+// took 1.4 ms for 302 experts x 15360 rows and 3.8 ms for 512 x 10 x 4096 on M1 Max):
+//   clear:   tokens per expert to 0 and the grid of the mul_mm_id dispatch to (1, (ne01 + 63)/64, ne02)
+//   scatter: each (token, used expert) takes the next place of its expert with an atomic and raises the grid x size
+//            to the 32-token tiles that place needs. Ids outside [0, ne02) are skipped (padding).
+// The places within an expert come in any order; each output row is computed on its own, so the result is the same.
+kernel void kernel_mul_mm_id_map0_clear(
+        constant ggml_metal_kargs_mul_mm_id_map0 & args,
+        device char * htpe,
+        uint tpig[[thread_position_in_grid]]) {
+    device uint32_t * tpe_u32 = (device uint32_t *) htpe;
+    if (tpig < (uint) args.ne02) {
+        tpe_u32[tpig] = 0;
+    }
+    if (tpig == 0) {
+        tpe_u32[args.ne02 + 0] = 1;
+        tpe_u32[args.ne02 + 1] = (args.ne01 + 63)/64;
+        tpe_u32[args.ne02 + 2] = args.ne02;
+    }
+}
+
+kernel void kernel_mul_mm_id_map0_scatter(
+        constant ggml_metal_kargs_mul_mm_id_map0 & args,
+        device const char * src2,
+        device       char * htpe,
+        device       char * hids,
+        uint tpig[[thread_position_in_grid]]) {
+    if (tpig >= (uint) args.ne21) {
+        return;
+    }
+
+    device atomic_uint * tpe  = (device atomic_uint *) htpe;
+    device atomic_uint * grid = (device atomic_uint *) htpe + args.ne02;
+    device int32_t     * ids  = (device int32_t *) hids;
+
+    device const int32_t * src2_i32 = (device const int32_t *) (src2 + tpig*args.nb21);
+
+    for (int i20 = 0; i20 < args.ne20; i20++) {
+        const int32_t e = src2_i32[i20];
+        if (e < 0 || e >= args.ne02) {
+            continue;
+        }
+        const uint pos = atomic_fetch_add_explicit(&tpe[e], 1u, memory_order_relaxed);
+        ids[e*args.ne21 + pos] = tpig*args.ne20 + i20;
+        if (pos % 32 == 0) {
+            atomic_fetch_max_explicit(grid, pos/32 + 1, memory_order_relaxed);
+        }
+    }
+}
+
 template<short ne20> // n_expert_used
 kernel void kernel_mul_mm_id_map0(
         constant ggml_metal_kargs_mul_mm_id_map0 & args,

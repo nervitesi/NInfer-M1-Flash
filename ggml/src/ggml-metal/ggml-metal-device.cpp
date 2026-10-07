@@ -1137,6 +1137,19 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mm_id_amax(g
     return res;
 }
 
+ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mm_id_map0_step(ggml_metal_library_t lib, bool scatter) {
+    const char * name = scatter ? "kernel_mul_mm_id_map0_scatter" : "kernel_mul_mm_id_map0_clear";
+
+    ggml_metal_pipeline_with_params res = ggml_metal_library_get_pipeline(lib, name);
+    if (!res.pipeline) {
+        res = ggml_metal_library_compile_pipeline(lib, name, name, nullptr);
+    }
+
+    res.smem = 0;
+
+    return res;
+}
+
 ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mm_id_map0(ggml_metal_library_t lib, int ne02, int ne20) {
     char base[256];
     char name[256];
