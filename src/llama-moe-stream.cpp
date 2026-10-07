@@ -1001,7 +1001,45 @@ void llama_moe_stream::plan_pairs_locked(llama_moe_stream_layer & sl, const int3
     // expert slots first and then has to force the rest regardless of load.
     std::vector<std::vector<int32_t>> group(n_waves);
     std::vector<int64_t>              load (n_waves, 0);
-    {
+
+    // LLAMA_MOE_STREAM_RESIDENT_FIRST (default 1): experts already in the cache (or loading) go to the first waves and
+    // the misses to the last ones. The first waves then start without loads, and the slots they free take the misses
+    // of the later waves while the GPU works (the residency-blind order made wave 0 wait for its own ~40% of misses
+    // and evicted experts that later waves still needed). Within each class heavy and light experts alternate, and
+    // the waves are filled in order; the repair pass below keeps every wave within the chunk.
+    static const bool resident_first = [] {
+        const char * e = getenv("LLAMA_MOE_STREAM_RESIDENT_FIRST");
+        return !(e && atoi(e) == 0);
+    }();
+    if (resident_first) {
+        std::vector<int32_t> res, mis;
+        for (const int32_t e : order) {
+            (sl.expert_slot.find(e) != sl.expert_slot.end() ? res : mis).push_back(e);
+        }
+        std::vector<int32_t> seq;
+        seq.reserve(order.size());
+        for (const auto * cls : { &res, &mis }) {
+            size_t i = 0, j = cls->size();
+            while (i < j) {
+                seq.push_back((*cls)[i++]);
+                if (i < j) {
+                    seq.push_back((*cls)[--j]);
+                }
+            }
+        }
+        std::vector<uint32_t> left(room);
+        uint32_t w = 0;
+        for (const int32_t e : seq) {
+            while (w + 1 < n_waves && left[w] == 0) {
+                w++;
+            }
+            group[w].push_back(e);
+            load [w] += sl.pair_count[e];
+            if (left[w] > 0) {
+                left[w]--;
+            }
+        }
+    } else {
         std::vector<uint32_t> left(room);
         std::vector<uint32_t> seq;
         seq.reserve(order.size());
@@ -1200,8 +1238,20 @@ void llama_moe_stream::stage_wave_locked(std::unique_lock<std::mutex> & lk, llam
     const size_t reserved = (size_t) sl.plan_capacity + n_ids + 1; // this wave, parking, one victim
     const size_t max_keep = sl.n_slots > reserved ? sl.n_slots - reserved : 0;
 
+    // LLAMA_MOE_STREAM_PRELOAD_DEPTH (default 8): how many later waves are preloaded when slots allow, and whose
+    // resident experts are protected. With one wave of lookahead the SSD idled while the GPU worked (2.5 GB/s, under 4
+    // of the 9 readers busy in a 4096-token prompt).
+    static const size_t depth = [] {
+        const char * e = std::getenv("LLAMA_MOE_STREAM_PRELOAD_DEPTH");
+        return (size_t) std::max(1, e ? atoi(e) : 8);
+    }();
+    const size_t n_waves_plan = sl.wave_first.size();
+    const size_t last_wave    = std::min(n_waves_plan, nw + depth); // preload waves [nw, last_wave)
+    const size_t pend         = last_wave > nw && last_wave - 1 < n_waves_plan
+        ? sl.wave_first[last_wave - 1] + sl.wave_count[last_wave - 1] : nfirst + ncount;
+
     size_t n_kept = 0;
-    for (size_t i = nfirst; i < nfirst + ncount && n_kept < max_keep; i++) {
+    for (size_t i = nfirst; i < std::max(pend, nfirst + ncount) && n_kept < max_keep; i++) {
         const auto it = sl.expert_slot.find(sl.uniq[i]);
         if (it != sl.expert_slot.end()) {
             sl.keep[it->second] = 1;
@@ -1251,18 +1301,18 @@ void llama_moe_stream::stage_wave_locked(std::unique_lock<std::mutex> & lk, llam
         }
     }
 
-    // best-effort preload of the next wave; never waits, what cannot be reserved now becomes the
-    // next wave's demand load
+    // best-effort preload of the next waves, in wave order; never waits, what cannot be reserved now becomes a
+    // later wave's demand load
     static const bool no_preload = std::getenv("LLAMA_MOE_STREAM_NO_PRELOAD") != nullptr;
     if (!no_preload) {
-        for (size_t i = nfirst; i < nfirst + ncount; i++) {
+        for (size_t i = nfirst; i < std::max(pend, nfirst + ncount); i++) {
             const int32_t e = sl.uniq[i];
             if (sl.expert_slot.find(e) != sl.expert_slot.end()) {
                 continue;
             }
             const int32_t v = pick_victim_locked(sl, sl.keep.data());
             if (v < 0) {
-                continue;
+                break; // the kept set only grows: no later expert finds a victim either
             }
             if (!sl.seen[e]) {
                 stats.n_miss_cold++;
