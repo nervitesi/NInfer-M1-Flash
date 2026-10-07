@@ -11353,6 +11353,22 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
 // Test cases for performance evaluation: should be representative of real-world use cases
 static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     std::vector<std::unique_ptr<test_case>> test_cases;
+    // qwen4exp MoE at prompt widths: 512 experts and 10 used, and one streaming wave (302 cache slots, one expert per
+    // pair row); a dense GEMM of the same shape class for the attainable rate
+    for (int n : {512, 2048, 4096}) {
+        test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_IQ4_XS, GGML_TYPE_F32, 512, 10, true,   640, n, 2560));
+        test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_IQ4_NL, GGML_TYPE_F32, 512, 10, false, 2560, n,  640));
+    }
+    for (int n_mats : {64, 128, 302}) {
+        for (int n : {2048, 4096, 10240, 15360}) {
+            test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_IQ4_XS, GGML_TYPE_F32, n_mats, 1, false,  640, n, 2560));
+        }
+    }
+    test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_IQ4_NL, GGML_TYPE_F32, 302, 1, false, 2560, 10240,  640));
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_IQ4_XS, GGML_TYPE_F32, 6400, 4096, 2560, {1, 1}, {1, 1}));
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q4_0,   GGML_TYPE_F32, 6400, 4096, 2560, {1, 1}, {1, 1}));
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F16,    GGML_TYPE_F32, 6400, 4096, 2560, {1, 1}, {1, 1}));
+
     // qwen4exp MoE at MTP verify widths: random routing, and all tokens on the same experts
     for (int n : {1, 2, 4, 8}) {
         test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_IQ4_XS, GGML_TYPE_F32, 288, 10, true,   640, n, 2560));

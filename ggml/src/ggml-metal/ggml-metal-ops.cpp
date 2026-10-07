@@ -204,6 +204,10 @@ int ggml_metal_op_n_host_split(ggml_metal_op_t ctx) {
     return ctx->n_host_split;
 }
 
+struct ggml_tensor * ggml_metal_op_node(ggml_metal_op_t ctx, int idx) {
+    return ctx->node(idx);
+}
+
 int ggml_metal_op_n_nodes(ggml_metal_op_t ctx) {
     return ctx->n_nodes();
 }
@@ -2897,7 +2901,8 @@ size_t ggml_metal_op_mul_mat_id_extra_tpe(const ggml_tensor * op) {
 
     const int64_t ne02 = op->src[0]->ne[2]; // n_expert
 
-    return ggml_type_size(GGML_TYPE_I32)*ne02;
+    // tokens per expert, then the indirect dispatch size of mul_mm_id (3 x uint32, padded)
+    return ggml_type_size(GGML_TYPE_I32)*ne02 + 16;
 }
 
 size_t ggml_metal_op_mul_mat_id_extra_ids(const ggml_tensor * op) {
@@ -3012,6 +3017,7 @@ int ggml_metal_op_mul_mat_id(ggml_metal_op_t ctx, int idx) {
                 ne21, // n_tokens
                 ne20, // n_expert_used
                 nb21,
+                (int32_t) ne01,
             };
 
             auto pipeline = ggml_metal_library_get_pipeline_mul_mm_id_map0(lib, ne02, ne20);
@@ -3082,7 +3088,11 @@ int ggml_metal_op_mul_mat_id(ggml_metal_op_t ctx, int idx) {
 
             ggml_metal_encoder_set_threadgroup_memory_size(enc, smem, 0);
 
-            ggml_metal_encoder_dispatch_threadgroups(enc, (ne21 + 31)/32, (ne01 + 63)/64, ne02, 128, 1, 1);
+            // map0 wrote the grid after the tokens per expert: ((busiest expert + 31)/32, (ne01 + 63)/64, ne02)
+            ggml_metal_buffer_id bid_grid = bid_tpe;
+            bid_grid.offs += ggml_type_size(GGML_TYPE_I32)*ne02;
+
+            ggml_metal_encoder_dispatch_threadgroups_indirect(enc, bid_grid, 128, 1, 1);
         }
     } else {
         auto pipeline = ggml_metal_library_get_pipeline_mul_mv_id(lib, op, ggml_metal_m1_tuning(props_dev));

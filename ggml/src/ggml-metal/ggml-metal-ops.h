@@ -45,6 +45,9 @@ void ggml_metal_op_count_dump(int n_nodes_graph);
 
 int ggml_metal_op_n_nodes(ggml_metal_op_t ctx);
 
+// the graph node behind encoding index idx (the op context skips some graph nodes)
+struct ggml_tensor * ggml_metal_op_node(ggml_metal_op_t ctx, int idx);
+
 int ggml_metal_op_encode(ggml_metal_op_t ctx, int idx);
 
 //

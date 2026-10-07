@@ -368,6 +368,8 @@ kernel void kernel_mul_mm_id_map0(
         device        char * hids,
         threadgroup   char * shmem [[threadgroup(0)]],
         ushort tpitg[[thread_position_in_threadgroup]],
+        ushort tiisg[[thread_index_in_simdgroup]],
+        ushort sgitg[[simdgroup_index_in_threadgroup]],
         ushort   ntg[[threads_per_threadgroup]]) {
     const short ide = tpitg; // expert id
 
@@ -412,6 +414,25 @@ kernel void kernel_mul_mm_id_map0(
 
     device uint32_t * tpe_u32 = (device uint32_t *) (htpe);
     tpe_u32[ide] = n_all;
+
+    // grid of the mul_mm_id dispatch that follows (indirect, MTLDispatchThreadgroupsIndirectArguments after the
+    // tokens per expert): 32-token tiles up to the busiest expert, not up to all tokens. With many experts and
+    // few tokens each, the full grid was mostly threadgroups that exit at once (~5 ns each on M1 Max).
+    const uint32_t m = simd_max(n_all);
+    threadgroup uint32_t * smax = (threadgroup uint32_t *) shmem; // the token ids are no longer needed
+    if (tiisg == 0) {
+        smax[sgitg] = m;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tpitg == 0) {
+        uint32_t mm = 0;
+        for (short s = 0; s < (ntg + 31)/32; s++) {
+            mm = max(mm, smax[s]);
+        }
+        tpe_u32[ntg + 0] = max((mm + 31)/32, 1u);
+        tpe_u32[ntg + 1] = (args.ne01 + 63)/64;
+        tpe_u32[ntg + 2] = ntg;
+    }
 }
 
 kernel void kernel_mul_mm_id_amax_part_f32(

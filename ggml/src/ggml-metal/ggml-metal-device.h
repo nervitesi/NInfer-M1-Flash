@@ -86,6 +86,8 @@ void ggml_metal_encoder_set_buffer(ggml_metal_encoder_t encoder, struct ggml_met
 void ggml_metal_encoder_set_threadgroup_memory_size(ggml_metal_encoder_t encoder, size_t size, int idx);
 
 void ggml_metal_encoder_dispatch_threadgroups(ggml_metal_encoder_t encoder, int tg0, int tg1, int tg2, int tptg0, int tptg1, int tptg2);
+// grid size from the GPU: a MTLDispatchThreadgroupsIndirectArguments at args (4-byte aligned)
+void ggml_metal_encoder_dispatch_threadgroups_indirect(ggml_metal_encoder_t encoder, struct ggml_metal_buffer_id args, int tptg0, int tptg1, int tptg2);
 
 void ggml_metal_encoder_memory_barrier(ggml_metal_encoder_t encoder);
 
@@ -354,6 +356,8 @@ ggml_metal_encoder_t ggml_metal_mtl4_host_op(ggml_metal_mtl4_t m4, struct ggml_t
 ggml_metal_encoder_t ggml_metal_mtl4_flush  (ggml_metal_mtl4_t m4); // commits what is encoded so far, returns the new encoder
 uint64_t             ggml_metal_mtl4_end(ggml_metal_mtl4_t m4); // commits, frees m4, returns the completion value
 void                 ggml_metal_device_mtl4_wait(ggml_metal_device_t dev, uint64_t value);
+bool                 ggml_metal_prof_enabled(void);                                  // GGML_METAL4_PROFILE
+void                 ggml_metal_mtl4_set_label(ggml_metal_mtl4_t m4, const char * label); // what the current buffer holds
 bool                 ggml_metal_device_mtl4_error(ggml_metal_device_t dev);
 
 void ggml_metal_device_get_memory(ggml_metal_device_t dev, size_t * free, size_t * total);

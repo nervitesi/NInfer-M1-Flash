@@ -619,10 +619,44 @@ static enum ggml_status ggml_metal_graph_compute_mtl4(ggml_metal_t ctx, struct g
         int next_flush = ctx->m4_flush_first > 0 ? ctx->m4_flush_first : n_nodes;
         const int flush_step = ctx->m4_flush_parts > 0 ? MAX(64, n_nodes/ctx->m4_flush_parts) : n_nodes;
 
+        const bool prof = ggml_metal_prof_enabled();
+
         for (int idx = 0; idx < n_nodes; ++idx) {
             const int res = ggml_metal_op_encode(ctx_op, idx);
             if (res == 0) {
                 break;
+            }
+
+            if (prof) {
+                // GGML_METAL4_PROFILE: one command buffer per encoded node (a fused group counts as its first node),
+                // labeled by op and tensor name without the layer number
+                const struct ggml_tensor * node = ggml_metal_op_node(ctx_op, idx);
+                if (!ggml_metal_host_op_is_registered(node) && !ggml_is_empty(node) &&
+                    node->op != GGML_OP_NONE && node->op != GGML_OP_RESHAPE && node->op != GGML_OP_VIEW &&
+                    node->op != GGML_OP_TRANSPOSE && node->op != GGML_OP_PERMUTE) {
+                    // the tensor name with every number as '#' (layer, node index) and without " (view)"-like suffixes
+                    char name[GGML_MAX_NAME];
+                    size_t n = 0;
+                    for (const char * c = node->name; *c && n + 1 < sizeof(name); ++c) {
+                        if (c[0] == ' ' && c[1] == '(') {
+                            break;
+                        }
+                        if (*c >= '0' && *c <= '9') {
+                            if (n == 0 || name[n - 1] != '#') {
+                                name[n++] = '#';
+                            }
+                            continue;
+                        }
+                        name[n++] = *c;
+                    }
+                    name[n] = 0;
+                    char label[96];
+                    snprintf(label, sizeof(label), "%s%s %s", ggml_op_desc(node), res > 1 ? "+" : "", name);
+                    ggml_metal_mtl4_set_label(m4, label);
+                    if (idx + res < n_nodes) {
+                        ggml_metal_op_mtl4_flush(ctx_op);
+                    }
+                }
             }
 
             idx += res - 1;

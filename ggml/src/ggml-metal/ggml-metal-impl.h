@@ -566,6 +566,7 @@ typedef struct {
     int32_t  ne21; // n_tokens
     int32_t  ne20;  // n_expert_used
     uint64_t nb21;
+    int32_t  ne01;  // rows of each expert matrix: the y size of the mul_mm_id grid written for the indirect dispatch
 } ggml_metal_kargs_mul_mm_id_map0;
 
 typedef struct {
