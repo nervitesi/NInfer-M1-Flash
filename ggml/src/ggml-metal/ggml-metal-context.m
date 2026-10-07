@@ -619,7 +619,7 @@ static enum ggml_status ggml_metal_graph_compute_mtl4(ggml_metal_t ctx, struct g
         int next_flush = ctx->m4_flush_first > 0 ? ctx->m4_flush_first : n_nodes;
         const int flush_step = ctx->m4_flush_parts > 0 ? MAX(64, n_nodes/ctx->m4_flush_parts) : n_nodes;
 
-        const bool prof = ggml_metal_prof_enabled();
+        const bool prof = ggml_metal_prof_level() == 1;
 
         for (int idx = 0; idx < n_nodes; ++idx) {
             const int res = ggml_metal_op_encode(ctx_op, idx);

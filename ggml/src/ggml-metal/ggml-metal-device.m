@@ -2043,13 +2043,19 @@ static struct {
     int    n_bad; // feedback without a usable GPU time
 } g_metal_prof = { PTHREAD_MUTEX_INITIALIZER };
 
-bool ggml_metal_prof_enabled(void) {
-    static int enabled = -1;
-    if (enabled < 0) {
+// 0 off, 1 one command buffer per node, 2 only the buffers the graph has anyway (between host ops): GPU busy
+// against wall time without inflating graphs of many tiny ops
+int ggml_metal_prof_level(void) {
+    static int level = -1;
+    if (level < 0) {
         const char * s = getenv("GGML_METAL4_PROFILE");
-        enabled = s && atoi(s) != 0;
+        level = s ? atoi(s) : 0;
     }
-    return enabled != 0;
+    return level;
+}
+
+bool ggml_metal_prof_enabled(void) {
+    return ggml_metal_prof_level() != 0;
 }
 
 static int ggml_metal_prof_cmp(const void * a, const void * b) {
@@ -2477,7 +2483,7 @@ ggml_metal_encoder_t ggml_metal_mtl4_host_op(ggml_metal_mtl4_t m4, struct ggml_t
 ggml_metal_encoder_t ggml_metal_mtl4_flush(ggml_metal_mtl4_t m4) {
     ggml_metal_device_t dev = m4->dev;
 
-    if (ggml_metal_prof_enabled()) {
+    if (ggml_metal_prof_level() == 1) {
         // one buffer per node: each one signals a value of its own, so no allocators wait on a later signal
         ggml_metal_mtl4_commit_cb(m4, atomic_fetch_add(&dev->host_value, 2) + 1);
         ggml_metal_mtl4_begin_cb(m4);

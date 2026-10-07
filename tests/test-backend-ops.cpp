@@ -11359,6 +11359,18 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
         test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_IQ4_XS, GGML_TYPE_F32, 512, 10, true,   640, n, 2560));
         test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_IQ4_NL, GGML_TYPE_F32, 512, 10, false, 2560, n,  640));
     }
+    // qwen4exp dense projections at MTP verify width (4 tokens): bandwidth-bound
+    for (int n : {1, 4}) {
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q5_K,   GGML_TYPE_F32, 10240, n,  2560, {1, 1}, {1, 1})); // attn_qkv
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_IQ4_XS, GGML_TYPE_F32,  6144, n,  2560, {1, 1}, {1, 1})); // attn_gate
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_IQ4_XS, GGML_TYPE_F32,  2560, n,  6144, {1, 1}, {1, 1})); // ssm_out
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F32,    GGML_TYPE_F32,   512, n,  2560, {1, 1}, {1, 1})); // router
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_IQ4_NL, GGML_TYPE_F32, 10240, n,   320, {1, 1}, {1, 1})); // hc up
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_IQ4_XS, GGML_TYPE_F32,   320, n, 10240, {1, 1}, {1, 1})); // hc down
+        test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_IQ4_XS, GGML_TYPE_F32, 288, 10, true,   640, n, 2560));
+        test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_IQ4_NL, GGML_TYPE_F32, 288, 10, false, 2560, n,  640));
+    }
+
     // routing only: the matrices are tiny, so the time is map0 and the dispatch
     for (int n : {4096, 15360}) {
         test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_F16, GGML_TYPE_F32, 302, 1, false, 64, n, 32));
