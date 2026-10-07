@@ -2006,6 +2006,7 @@ struct ggml_metal_mtl4 {
 
     char label[96]; // GGML_METAL4_PROFILE: what the current command buffer holds
     bool prof_last; // GGML_METAL4_PROFILE: the current command buffer ends the graph
+    double flop;    // GGML_METAL4_PROFILE: arithmetic of the matrix ops in it
 };
 
 // a command buffer waiting to be committed, with the queue wait before it and the signal after it
@@ -2016,6 +2017,7 @@ struct ggml_metal_mtl4_item {
     uint64_t after;  // committed once host_event reaches it, 0 = right away
     char *   label;  // GGML_METAL4_PROFILE, owned by the item, NULL otherwise
     bool     last;   // the end of a graph: the profile is printed when it completes
+    double   flop;   // GGML_METAL4_PROFILE: arithmetic of the buffer's matrix ops
 };
 
 //
@@ -2029,6 +2031,7 @@ struct ggml_metal_prof_entry {
     char   key[96];
     double s;
     int    n;
+    double flop;
 };
 
 static struct {
@@ -2054,7 +2057,7 @@ static int ggml_metal_prof_cmp(const void * a, const void * b) {
     return x < y ? 1 : x > y ? -1 : 0;
 }
 
-static void ggml_metal_prof_add(const char * key, double start, double end, bool last) {
+static void ggml_metal_prof_add(const char * key, double start, double end, bool last, double flop) {
     pthread_mutex_lock(&g_metal_prof.mtx);
     if (!(end > start && start > 0)) {
         g_metal_prof.n_bad++;
@@ -2079,11 +2082,13 @@ static void ggml_metal_prof_add(const char * key, double start, double end, bool
             snprintf(g_metal_prof.e[i].key, sizeof(g_metal_prof.e[i].key), "%s", key);
             g_metal_prof.e[i].s = 0;
             g_metal_prof.e[i].n = 0;
+            g_metal_prof.e[i].flop = 0;
             g_metal_prof.n++;
         }
         if (i < g_metal_prof.n) {
             g_metal_prof.e[i].s += d;
             g_metal_prof.e[i].n++;
+            g_metal_prof.e[i].flop += flop;
         }
     }
     if (last && g_metal_prof.n_cb > 0) {
@@ -2092,8 +2097,12 @@ static void ggml_metal_prof_add(const char * key, double start, double end, bool
         GGML_LOG_WARN("metal4 profile: %d command buffers (%d more without a GPU time), GPU busy %.1f ms of %.1f ms (%.1f%%)\n",
                 g_metal_prof.n_cb, g_metal_prof.n_bad, g_metal_prof.busy*1e3, span*1e3, span > 0 ? 100.0*g_metal_prof.busy/span : 0.0);
         for (int i = 0; i < g_metal_prof.n && i < 60; ++i) {
-            GGML_LOG_WARN("metal4 profile: %8.1f ms %5.1f%% %6d x  %s\n", g_metal_prof.e[i].s*1e3,
-                    g_metal_prof.busy > 0 ? 100.0*g_metal_prof.e[i].s/g_metal_prof.busy : 0.0, g_metal_prof.e[i].n, g_metal_prof.e[i].key);
+            char rate[32] = "";
+            if (g_metal_prof.e[i].flop > 0 && g_metal_prof.e[i].s > 0) {
+                snprintf(rate, sizeof(rate), " %6.2f TFLOPS", g_metal_prof.e[i].flop/g_metal_prof.e[i].s/1e12);
+            }
+            GGML_LOG_WARN("metal4 profile: %8.1f ms %5.1f%% %6d x%s  %s\n", g_metal_prof.e[i].s*1e3,
+                    g_metal_prof.busy > 0 ? 100.0*g_metal_prof.e[i].s/g_metal_prof.busy : 0.0, g_metal_prof.e[i].n, rate, g_metal_prof.e[i].key);
         }
         // the same by op alone
         struct ggml_metal_prof_entry ops[128];
@@ -2140,8 +2149,9 @@ static void ggml_metal_prof_add(const char * key, double start, double end, bool
     pthread_mutex_unlock(&g_metal_prof.mtx);
 }
 
-void ggml_metal_mtl4_set_label(ggml_metal_mtl4_t m4, const char * label) {
+void ggml_metal_mtl4_set_label(ggml_metal_mtl4_t m4, const char * label, double flop) {
     snprintf(m4->label, sizeof(m4->label), "%s", label);
+    m4->flop = flop;
 }
 
 bool ggml_metal_device_supports_mtl4(ggml_metal_device_t dev) {
@@ -2172,6 +2182,7 @@ static void ggml_metal_mtl4_pump(ggml_metal_device_t dev) {
         if (it->label) {
             char * label = it->label;
             const bool last = it->last;
+            const double flop = it->flop;
             it->label = NULL;
             MTL4CommitOptions * opts = [[MTL4CommitOptions alloc] init];
             [opts addFeedbackHandler:^(id<MTL4CommitFeedback> fb) {
@@ -2179,7 +2190,7 @@ static void ggml_metal_mtl4_pump(ggml_metal_device_t dev) {
                     GGML_LOG_ERROR("ggml_metal_mtl4: command buffer failed: %s\n", [[fb.error description] UTF8String]);
                     atomic_store(&dev->m4_error, true);
                 }
-                ggml_metal_prof_add(label, fb.GPUStartTime, fb.GPUEndTime, last);
+                ggml_metal_prof_add(label, fb.GPUStartTime, fb.GPUEndTime, last, flop);
                 free(label);
             }];
             [q commit:&cb count:1 options:opts];
@@ -2199,7 +2210,7 @@ static void ggml_metal_mtl4_pump(ggml_metal_device_t dev) {
 }
 
 static void ggml_metal_mtl4_enqueue(ggml_metal_device_t dev, id<MTL4CommandBuffer> cb, uint64_t wait, uint64_t signal, uint64_t after,
-        const char * label, bool last) {
+        const char * label, bool last, double flop) {
     pthread_mutex_lock(&dev->m4_commit_mtx);
     // a queued buffer holds its allocator, and an allocator is reused only after its buffer completed
     GGML_ASSERT(dev->m4_items_count < GGML_METAL4_N_ALLOC);
@@ -2210,6 +2221,7 @@ static void ggml_metal_mtl4_enqueue(ggml_metal_device_t dev, id<MTL4CommandBuffe
     it->after  = after;
     it->label  = label ? strdup(label) : NULL;
     it->last   = last;
+    it->flop   = flop;
     dev->m4_items_count++;
     pthread_mutex_unlock(&dev->m4_commit_mtx);
 
@@ -2361,9 +2373,10 @@ static void ggml_metal_mtl4_submit_cb(struct ggml_metal_mtl4 * m4, uint64_t sign
 
     const bool prof = ggml_metal_prof_enabled();
     ggml_metal_mtl4_enqueue(dev, m4->cb, m4->wait_next, signal, m4->jit ? m4->gate : 0,
-            prof ? (m4->label[0] ? m4->label : "(between nodes)") : NULL, prof && m4->prof_last);
+            prof ? (m4->label[0] ? m4->label : "(between nodes)") : NULL, prof && m4->prof_last, m4->flop);
     m4->wait_next = 0;
     m4->label[0] = 0;
+    m4->flop = 0;
 
     [m4->cb release];
     m4->cb = nil;

@@ -11359,6 +11359,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
         test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_IQ4_XS, GGML_TYPE_F32, 512, 10, true,   640, n, 2560));
         test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_IQ4_NL, GGML_TYPE_F32, 512, 10, false, 2560, n,  640));
     }
+    for (ggml_type tb : {GGML_TYPE_F32, GGML_TYPE_F16}) {
+        test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_IQ4_XS, tb, 128, 1, false,  640, 10240, 2560));
+        test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_IQ4_NL, tb, 128, 1, false, 2560, 10240,  640));
+    }
     for (int n_mats : {64, 128, 302}) {
         for (int n : {2048, 4096, 10240, 15360}) {
             test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_IQ4_XS, GGML_TYPE_F32, n_mats, 1, false,  640, n, 2560));

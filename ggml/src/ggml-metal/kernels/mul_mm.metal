@@ -404,9 +404,12 @@ kernel void kernel_mul_mm_id_map0(
                 sel += (sids[i20] == ide)*(i20 + 1);
             }
 
-            ids_i32[n_all] = (i21 + t)*ne20 + sel - 1;
-
-            n_all += sel > 0;
+            // only the rows of this expert: with many experts and tokens the unconditional store was ~ne21 stores per
+            // thread, almost all of them overwritten
+            if (sel > 0) {
+                ids_i32[n_all] = (i21 + t)*ne20 + sel - 1;
+                n_all++;
+            }
         }
 
         threadgroup_barrier(mem_flags::mem_threadgroup);

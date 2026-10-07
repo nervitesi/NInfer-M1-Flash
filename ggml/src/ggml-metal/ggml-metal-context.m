@@ -652,7 +652,16 @@ static enum ggml_status ggml_metal_graph_compute_mtl4(ggml_metal_t ctx, struct g
                     name[n] = 0;
                     char label[96];
                     snprintf(label, sizeof(label), "%s%s %s", ggml_op_desc(node), res > 1 ? "+" : "", name);
-                    ggml_metal_mtl4_set_label(m4, label);
+                    // arithmetic of the matrix ops, for a rate next to the time
+                    double flop = 0;
+                    if (node->op == GGML_OP_MUL_MAT || node->op == GGML_OP_MUL_MAT_ID) {
+                        flop = 2.0*node->src[0]->ne[0]*ggml_nelements(node);
+                    } else if (node->op == GGML_OP_FLASH_ATTN_EXT) {
+                        const struct ggml_tensor * q = node->src[0];
+                        const struct ggml_tensor * k = node->src[1];
+                        flop = 4.0*q->ne[0]*q->ne[1]*q->ne[2]*q->ne[3]*k->ne[1];
+                    }
+                    ggml_metal_mtl4_set_label(m4, label, flop);
                     if (idx + res < n_nodes) {
                         ggml_metal_op_mtl4_flush(ctx_op);
                     }
