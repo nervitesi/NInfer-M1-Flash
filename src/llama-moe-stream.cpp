@@ -190,6 +190,9 @@ llama_moe_stream::llama_moe_stream(uint32_t n_layer, uint32_t n_slots, int32_t n
         if (!e || atoi(e) != 0) {
             ggml_backend_metal_register_host_op((void *) llama_moe_stream_remap);
             ggml_backend_metal_register_host_op((void *) llama_moe_stream_remap_la);
+            ggml_backend_metal_register_host_op((void *) llama_moe_stream_remap2a);
+            ggml_backend_metal_register_host_op((void *) llama_moe_stream_remap2a_la);
+            ggml_backend_metal_register_host_op((void *) llama_moe_stream_remap2b);
             ggml_backend_metal_register_host_op((void *) llama_moe_stream_wave_ids);
             ggml_backend_metal_register_host_op((void *) llama_moe_stream_wave_mask);
             ggml_backend_metal_register_host_op((void *) llama_moe_stream_wave_pairs);
@@ -712,16 +715,15 @@ void llama_moe_stream::print_stats() const {
 // remap op (single-threaded on ith 0): make every expert the router picked resident - reserving
 // slots and demand-loading misses, waiting until they commit - then rewrite each id to its cache
 // slot. Only the ids change, so the same experts are computed in the same order.
-void llama_moe_stream_remap(ggml_tensor * dst, const ggml_tensor * a, int ith, int nth, void * userdata) {
-    GGML_UNUSED(nth);
-    if (ith != 0) {
-        return;
-    }
-
+// mode 0: map every pair to its slot, loading the misses and waiting for them.
+// mode 1 (two-phase, first half): map the pairs whose expert is resident, -1 for the others (the expert GEMMs skip
+//         them and write zeros); start the loads without waiting.
+// mode 2 (second half, after the first half's GEMMs ran): wait for those loads and map only the deferred pairs.
+// The GPU computes the resident experts while the misses load; each pair is computed in exactly one half.
+static void llama_moe_stream_remap_impl(ggml_tensor * dst, const ggml_tensor * a, llama_moe_stream_layer * sl, int mode) {
     // timed from before the lock: the GPU is idle while this CPU op runs
     const int64_t t_op0 = ggml_time_us();
 
-    auto * sl  = (llama_moe_stream_layer *) userdata;
     auto * mgr = sl->mgr;
 
     GGML_ASSERT(a->type == GGML_TYPE_I32);
@@ -826,7 +828,22 @@ void llama_moe_stream_remap(ggml_tensor * dst, const ggml_tensor * a, int ith, i
         }
     }
 
-    if (waited) {
+    // LLAMA_MOE_STREAM_TWO_PHASE=2: per layer, two-phase only where misses are frequent; the second half costs a gate
+    // and three dispatches, which a layer that rarely misses does not earn back
+    {
+        bool missed = false;
+        for (const int32_t s : sl->demand_slots) {
+            missed = missed || sl->slot_state[s] != LLAMA_MOE_STREAM_SLOT_RESIDENT;
+        }
+        sl->miss_ema = 0.95f*sl->miss_ema + 0.05f*(missed ? 1.0f : 0.0f);
+        if (!sl->two_phase && sl->miss_ema > 0.30f) {
+            sl->two_phase = true;
+        } else if (sl->two_phase && sl->miss_ema < 0.15f) {
+            sl->two_phase = false;
+        }
+    }
+
+    if (waited && mode == 0) {
         const int64_t t0 = ggml_time_us();
         mgr->cv_done.wait(lk, [&]{
             if (mgr->load_failed) {
@@ -845,10 +862,87 @@ void llama_moe_stream_remap(ggml_tensor * dst, const ggml_tensor * a, int ith, i
         mgr->stats.t_stall_us += ggml_time_us() - t0;
     }
 
+    if (mode == 1) {
+        sl->defer.assign(n, 0);
+    }
     for (int64_t i = 0; i < n; i++) {
         const int32_t s = sl->expert_slot.at(ids[i]);
         sl->slot_last_use[s] = ++sl->use_counter;
-        out[i] = s;
+        if (mode == 1 && sl->slot_state[s] != LLAMA_MOE_STREAM_SLOT_RESIDENT) {
+            sl->defer[i] = 1;
+            out[i] = -1;
+        } else {
+            out[i] = s;
+        }
+    }
+
+    mgr->stats.t_remap_op_us += ggml_time_us() - t_op0;
+}
+
+void llama_moe_stream_remap(ggml_tensor * dst, const ggml_tensor * a, int ith, int nth, void * userdata) {
+    GGML_UNUSED(nth);
+    if (ith != 0) {
+        return;
+    }
+    llama_moe_stream_remap_impl(dst, a, (llama_moe_stream_layer *) userdata, 0);
+}
+
+void llama_moe_stream_remap2a(ggml_tensor * dst, const ggml_tensor * a, int ith, int nth, void * userdata) {
+    GGML_UNUSED(nth);
+    if (ith != 0) {
+        return;
+    }
+    llama_moe_stream_remap_impl(dst, a, (llama_moe_stream_layer *) userdata, 1);
+}
+
+// second half: src[0] = the router's ids, src[1] = an ordering token from the first half's GEMM output
+void llama_moe_stream_remap2b(ggml_tensor * dst, int ith, int nth, void * userdata) {
+    GGML_UNUSED(nth);
+    if (ith != 0) {
+        return;
+    }
+    const int64_t t_op0 = ggml_time_us();
+
+    auto * sl  = (llama_moe_stream_layer *) userdata;
+    auto * mgr = sl->mgr;
+
+    const ggml_tensor * a = dst->src[0];
+    GGML_ASSERT(a->type == GGML_TYPE_I32 && ggml_is_contiguous(a) && ggml_nelements(a) == ggml_nelements(dst));
+    const int64_t   n   = ggml_nelements(a);
+    const int32_t * ids = (const int32_t *) a->data;
+          int32_t * out = (int32_t *) dst->data;
+
+    std::unique_lock<std::mutex> lk(mgr->mtx);
+    GGML_ASSERT((int64_t) sl->defer.size() == n);
+
+    bool any = false;
+    for (int64_t i = 0; i < n; i++) {
+        any = any || sl->defer[i];
+    }
+    if (any) {
+        const int64_t t0 = ggml_time_us();
+        mgr->cv_done.wait(lk, [&]{
+            if (mgr->load_failed) {
+                return true;
+            }
+            for (int64_t i = 0; i < n; i++) {
+                if (sl->defer[i]) {
+                    const auto it = sl->expert_slot.find(ids[i]);
+                    if (it == sl->expert_slot.end() || sl->slot_state[it->second] != LLAMA_MOE_STREAM_SLOT_RESIDENT) {
+                        return false;
+                    }
+                }
+            }
+            return true;
+        });
+        if (mgr->load_failed) {
+            GGML_ABORT("MoE expert streaming: expert load failed (I/O error)");
+        }
+        mgr->stats.t_stall_us += ggml_time_us() - t0;
+    }
+
+    for (int64_t i = 0; i < n; i++) {
+        out[i] = sl->defer[i] ? sl->expert_slot.at(ids[i]) : -1;
     }
 
     mgr->stats.t_remap_op_us += ggml_time_us() - t_op0;
@@ -882,11 +976,14 @@ static void llama_moe_stream_prefetch_next(llama_moe_stream_lookahead * la, cons
     }
 }
 
-void llama_moe_stream_remap_la(ggml_tensor * dst, const ggml_tensor * a, const ggml_tensor * b, int ith, int nth, void * userdata) {
+static void llama_moe_stream_remap_la_impl(ggml_tensor * dst, const ggml_tensor * a, const ggml_tensor * b, int ith, void * userdata, int mode) {
     auto * la = (llama_moe_stream_lookahead *) userdata;
 
-    if (ith != 0 || la->sl_next == nullptr || la->top_k == 0) {
-        llama_moe_stream_remap(dst, a, ith, nth, la->sl);
+    if (ith != 0) {
+        return;
+    }
+    if (la->sl_next == nullptr || la->top_k == 0) {
+        llama_moe_stream_remap_impl(dst, a, la->sl, mode);
         return;
     }
 
@@ -903,11 +1000,21 @@ void llama_moe_stream_remap_la(ggml_tensor * dst, const ggml_tensor * a, const g
         }
     }
 
-    llama_moe_stream_remap(dst, a, ith, nth, la->sl);
+    llama_moe_stream_remap_impl(dst, a, la->sl, mode);
     std::unique_lock<std::mutex> lk(la->sl_next->mgr->mtx);
     if (!la->sl_next->mgr->load_failed) {
         llama_moe_stream_prefetch_next(la, logits, (uint32_t) n_tok);
     }
+}
+
+void llama_moe_stream_remap_la(ggml_tensor * dst, const ggml_tensor * a, const ggml_tensor * b, int ith, int nth, void * userdata) {
+    GGML_UNUSED(nth);
+    llama_moe_stream_remap_la_impl(dst, a, b, ith, userdata, 0);
+}
+
+void llama_moe_stream_remap2a_la(ggml_tensor * dst, const ggml_tensor * a, const ggml_tensor * b, int ith, int nth, void * userdata) {
+    GGML_UNUSED(nth);
+    llama_moe_stream_remap_la_impl(dst, a, b, ith, userdata, 1);
 }
 
 // wave 0 of a ubatch: record the distinct touched experts (sl.uniq, first-use order) and split

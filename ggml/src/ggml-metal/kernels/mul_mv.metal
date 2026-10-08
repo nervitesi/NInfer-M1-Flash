@@ -214,6 +214,7 @@ constant short FC_mul_mv_ne12  [[function_constant(FC_MUL_MV + 2)]];
 constant short FC_mul_mv_r2    [[function_constant(FC_MUL_MV + 3)]];
 constant short FC_mul_mv_r3    [[function_constant(FC_MUL_MV + 4)]];
 constant bool  FC_mul_mv_split [[function_constant(FC_MUL_MV + 5)]];
+constant bool  FC_mul_mv_id_compact [[function_constant(FC_MUL_MV + 6)]]; // mul_mv_id: pairs from a compact list
 
 template<typename block_q_type, short NR0, typename args_t>
 void mul_vec_q_n_f32_impl(
@@ -3303,17 +3304,33 @@ kernel void kernel_mul_mv_id(
         device const char * src1,
         device       char * dst,
         device const char * ids,
+        device const int32_t * list,
         threadgroup  char * shmem [[threadgroup(0)]],
         uint3  tgpig[[threadgroup_position_in_grid]],
         ushort tiitg[[thread_index_in_threadgroup]],
         ushort tiisg[[thread_index_in_simdgroup]],
-        ushort sgitg[[simdgroup_index_in_threadgroup]]) {
-    const int iid1 = tgpig.z/args.nei0;
-    const int idx  = tgpig.z%args.nei0;
+        ushort sgitg[[simdgroup_index_in_threadgroup]],
+        ushort3 ntg [[threads_per_threadgroup]]) {
+    // compact: the grid covers only the valid pairs, listed by kernel_mul_mv_id_compact
+    const int zp   = FC_mul_mv_id_compact ? list[tgpig.z] : (int) tgpig.z;
+    const int iid1 = zp/args.nei0;
+    const int idx  = zp%args.nei0;
 
     tgpig.z = 0;
 
     const int32_t i02 = ((device const int32_t *) (ids + iid1*args.nbi1))[idx];
+
+    // a negative id skips the pair (two-phase MoE streaming computes it in the other half): its output row is zero
+    if (i02 < 0) {
+        if (tgpig.x == 0 && tgpig.y == 0) {
+            device float * dst_row = (device float *) (dst + (idx*args.ne0 + iid1*args.ne1*args.ne0)*sizeof(float));
+            const int nt = ntg.x*ntg.y*ntg.z;
+            for (int i = tiitg; i < args.ne0; i += nt) {
+                dst_row[i] = 0.0f;
+            }
+        }
+        return;
+    }
 
     const int64_t i11 = idx % args.ne11;
     const int64_t i12 = iid1;
@@ -3358,6 +3375,59 @@ kernel void kernel_mul_mv_id(
         tiitg,
         tiisg,
         sgitg);
+}
+
+// For ids that are mostly -1 (the second half of two-phase MoE streaming): list the valid (token, expert) pairs, zero the
+// output rows of the others and write the grid of an indirect kernel_mul_mv_id dispatch over the list, so a layer with
+// nothing left to compute launches no threadgroups. One threadgroup.
+kernel void kernel_mul_mv_id_compact(
+        constant ggml_metal_kargs_mul_mv_id & args,
+        device const char * ids,
+        device       char * dst,
+        device   uint32_t * grid,
+        device    int32_t * list,
+        constant uint32_t & gx,
+        ushort tpitg[[thread_position_in_threadgroup]],
+        ushort   ntg[[threads_per_threadgroup]]) {
+    threadgroup atomic_uint cnt;
+    threadgroup atomic_uint nskip;
+    threadgroup int32_t     skip[512];
+
+    if (tpitg == 0) {
+        atomic_store_explicit(&cnt,   0u, memory_order_relaxed);
+        atomic_store_explicit(&nskip, 0u, memory_order_relaxed);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    const int n = args.nei0*args.nei1;
+    for (int z = tpitg; z < n; z += ntg) {
+        const int iid1 = z/args.nei0;
+        const int idx  = z%args.nei0;
+        const int32_t i02 = ((device const int32_t *) (ids + iid1*args.nbi1))[idx];
+        if (i02 >= 0) {
+            list[atomic_fetch_add_explicit(&cnt, 1u, memory_order_relaxed)] = z;
+        } else {
+            skip[atomic_fetch_add_explicit(&nskip, 1u, memory_order_relaxed)] = z;
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // zero the skipped rows with every thread, four floats at a time
+    const uint ns  = atomic_load_explicit(&nskip, memory_order_relaxed);
+    const uint ne4 = (uint) args.ne0/4;
+    for (uint k = tpitg; k < ns*ne4; k += ntg) {
+        const int z    = skip[k/ne4];
+        const int iid1 = z/args.nei0;
+        const int idx  = z%args.nei0;
+        device float4 * row = (device float4 *) (dst + (idx*args.ne0 + iid1*args.ne1*args.ne0)*sizeof(float));
+        row[k%ne4] = 0.0f;
+    }
+
+    if (tpitg == 0) {
+        grid[0] = gx;
+        grid[1] = 1;
+        grid[2] = atomic_load_explicit(&cnt, memory_order_relaxed);
+    }
 }
 
 typedef decltype(kernel_mul_mv_id<mmv_fn<kernel_mul_mv_t_t_disp<float, float>>>) kernel_mul_mv_id_t;

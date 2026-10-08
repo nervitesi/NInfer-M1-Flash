@@ -2257,9 +2257,27 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     }
 
     ggml_tensor * ids_gemm = selected_experts;
+    // two-phase MoE streaming for small batches (LLAMA_MOE_STREAM_TWO_PHASE, default 1): the first remap maps the
+    // resident experts (-1 for the misses, which the expert mat-vecs skip with zero output) and starts the loads; the
+    // second one, after the first half's GEMMs, waits for the misses and maps only those. The GPU computes the resident
+    // experts while the SSD reads the rest; each pair comes from exactly one half, so the sum is the same result.
+    // Only below 32 tokens: the matrix-matrix path does not zero skipped rows.
+    // LLAMA_MOE_STREAM_TWO_PHASE: 0 (default) off, 1 every layer, 2 the layers that miss often (see miss_ema).
+    // Measured on the true Q4 with MTP3 (2026-10-08): the stall drops from 21% to 15% of the time, but the second
+    // gate and its dispatches cost about as much; 33.1 / 33.3 / 32.8 t/s for off / 1 / 2, identical text. Kept for
+    // slower drives or bigger misses, off by default.
+    static const int two_phase_env = [] {
+        const char * e = getenv("LLAMA_MOE_STREAM_TWO_PHASE");
+        return e ? atoi(e) : 0;
+    }();
+    const bool two_phase = msl && n_stream_waves == 1 && n_tokens < 32 && !weight_before_ffn &&
+        (two_phase_env == 1 || (two_phase_env == 2 && msl->two_phase));
+    ggml_tensor * ids_cont_tp = nullptr;
+
     if (msl && n_stream_waves == 1) {
         ggml_tensor * ids_cont = ggml_is_contiguous(selected_experts)
             ? selected_experts : ggml_cont(ctx0, selected_experts);
+        ids_cont_tp = ids_cont;
 
         // one-layer-ahead prefetch: predict the NEXT layer's routing from THIS layer's router input and
         // hand it to the same custom op, so the lookahead costs no extra graph split
@@ -2268,9 +2286,10 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
             ggml_prec_set_acc(la_logits, GGML_PREC_F32);
             cb(la_logits, "ffn_moe_logits_next", il);
 
-            ids_gemm = ggml_map_custom2(ctx0, ids_cont, la_logits, llama_moe_stream_remap_la, 1, msl->la.get());
+            ids_gemm = ggml_map_custom2(ctx0, ids_cont, la_logits,
+                    two_phase ? llama_moe_stream_remap2a_la : llama_moe_stream_remap_la, 1, msl->la.get());
         } else {
-            ids_gemm = ggml_map_custom1(ctx0, ids_cont, llama_moe_stream_remap, 1, msl);
+            ids_gemm = ggml_map_custom1(ctx0, ids_cont, two_phase ? llama_moe_stream_remap2a : llama_moe_stream_remap, 1, msl);
         }
         cb(ids_gemm, "ffn_moe_topk_stream", il);
     }
@@ -2545,6 +2564,24 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
             experts = experts == nullptr ? e_w : ggml_add(ctx0, experts, e_w);
             ggml_build_forward_expand(gf, experts);
         }
+    } else if (two_phase) {
+        ggml_tensor * e_a = build_expert_gemms(cur, ids_gemm, selected_experts);
+        ggml_build_forward_expand(gf, e_a);
+
+        // the second half runs after the first half's GEMMs (ordering token), waits for the misses and maps them
+        ggml_tensor * args[2] = { ids_cont_tp, ggml_view_1d(ctx0, e_a, 1, 0) };
+        ggml_tensor * ids_b = ggml_custom_4d(ctx0, GGML_TYPE_I32, ids_cont_tp->ne[0], ids_cont_tp->ne[1], 1, 1,
+                args, 2, llama_moe_stream_remap2b, 1, msl);
+        {
+            // mostly -1: Metal lists the valid pairs and dispatches over them only (see kernel_mul_mv_id_compact)
+            const uint32_t sparse_tag = 0x53525053; // "SPRS"
+            memcpy((char *) ids_b->op_params + 56, &sparse_tag, sizeof(sparse_tag));
+        }
+        cb(ids_b, "ffn_moe_topk_stream_b", il);
+
+        ggml_tensor * e_b = build_expert_gemms(cur, ids_b, selected_experts);
+        experts = ggml_add(ctx0, e_a, e_b);
+        cb(experts, "ffn_moe_two_phase", il);
     } else {
         experts = build_expert_gemms(cur, ids_gemm, selected_experts);
     }

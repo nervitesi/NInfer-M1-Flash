@@ -3117,7 +3117,15 @@ int ggml_metal_op_mul_mat_id(ggml_metal_op_t ctx, int idx) {
             ggml_metal_encoder_dispatch_threadgroups_indirect(enc, bid_grid, 128, 1, 1);
         }
     } else {
-        auto pipeline = ggml_metal_library_get_pipeline_mul_mv_id(lib, op, ggml_metal_m1_tuning(props_dev));
+        // ids marked sparse by their producer (op_params bytes 56..59 = "SPRS", the second half of two-phase MoE
+        // streaming): list the valid pairs and dispatch over them only
+        uint32_t sparse_tag = 0;
+        if (op->src[2]->op == GGML_OP_CUSTOM) {
+            memcpy(&sparse_tag, (const char *) op->src[2]->op_params + 56, sizeof(sparse_tag));
+        }
+        const bool compact = sparse_tag == 0x53525053;
+
+        auto pipeline = ggml_metal_library_get_pipeline_mul_mv_id(lib, op, ggml_metal_m1_tuning(props_dev), compact);
 
         const int nr0 = pipeline.nr0;
         const int nr1 = pipeline.nr1;
@@ -3164,13 +3172,48 @@ int ggml_metal_op_mul_mat_id(ggml_metal_op_t ctx, int idx) {
 
         ggml_metal_encoder_set_threadgroup_memory_size(enc, smem, 0);
 
-        if (op->src[0]->type == GGML_TYPE_F32 ||
-            op->src[0]->type == GGML_TYPE_F16 ||
-            op->src[0]->type == GGML_TYPE_BF16 ||
-            op->src[0]->type == GGML_TYPE_Q8_0) {
-            ggml_metal_encoder_dispatch_threadgroups(enc, (ne01 + nr0 - 1)/(nr0), (_ne1 + nr1 - 1)/nr1, ne123, 32, nsg, 1);
+        const bool by_nr0 = op->src[0]->type == GGML_TYPE_F32 ||
+                            op->src[0]->type == GGML_TYPE_F16 ||
+                            op->src[0]->type == GGML_TYPE_BF16 ||
+                            op->src[0]->type == GGML_TYPE_Q8_0;
+        const int gx = by_nr0 ? (ne01 + nr0 - 1)/(nr0) : (ne01 + nr0*nsg - 1)/(nr0*nsg);
+
+        if (compact) {
+            GGML_ASSERT((_ne1 + nr1 - 1)/nr1 == 1);
+
+            // the list and the grid live in the extra memory of MUL_MAT_ID (ids region, tpe region)
+            ggml_metal_buffer_id bid_grid = bid_dst;
+            bid_grid.offs += ggml_nbytes(op);
+            ggml_metal_buffer_id bid_list = bid_grid;
+            bid_list.offs += ggml_metal_op_mul_mat_id_extra_tpe(op);
+
+            auto pl = ggml_metal_library_get_pipeline_mul_mv_id_compact(lib);
+            const uint32_t gxu = (uint32_t) gx;
+
+            ggml_metal_encoder_set_pipeline(enc, pl);
+            ggml_metal_encoder_set_bytes   (enc, &args, sizeof(args), 0);
+            ggml_metal_encoder_set_buffer  (enc, bid_src2, 1);
+            ggml_metal_encoder_set_buffer  (enc, bid_dst,  2);
+            ggml_metal_encoder_set_buffer  (enc, bid_grid, 3);
+            ggml_metal_encoder_set_buffer  (enc, bid_list, 4);
+            ggml_metal_encoder_set_bytes   (enc, (void *) &gxu, sizeof(gxu), 5);
+            GGML_ASSERT(ne20*ne21 <= 512 && ne0 % 4 == 0);
+            ggml_metal_encoder_dispatch_threadgroups(enc, 1, 1, 1, 1024, 1, 1);
+
+            ggml_metal_op_concurrency_reset(ctx);
+
+            ggml_metal_encoder_set_pipeline(enc, pipeline);
+            ggml_metal_encoder_set_bytes   (enc, &args, sizeof(args), 0);
+            ggml_metal_encoder_set_buffer  (enc, bid_src0, 1);
+            ggml_metal_encoder_set_buffer  (enc, bid_src1, 2);
+            ggml_metal_encoder_set_buffer  (enc, bid_dst,  3);
+            ggml_metal_encoder_set_buffer  (enc, bid_src2, 4);
+            ggml_metal_encoder_set_buffer  (enc, bid_list, 5);
+            ggml_metal_encoder_set_threadgroup_memory_size(enc, smem, 0);
+
+            ggml_metal_encoder_dispatch_threadgroups_indirect(enc, bid_grid, 32, nsg, 1);
         } else {
-            ggml_metal_encoder_dispatch_threadgroups(enc, (ne01 + nr0*nsg - 1)/(nr0*nsg), (_ne1 + nr1 - 1)/nr1, ne123, 32, nsg, 1);
+            ggml_metal_encoder_dispatch_threadgroups(enc, gx, (_ne1 + nr1 - 1)/nr1, ne123, 32, nsg, 1);
         }
     }
 

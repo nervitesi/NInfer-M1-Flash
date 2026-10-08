@@ -103,6 +103,9 @@ struct llama_moe_stream_layer {
     std::vector<uint8_t> touched;
     std::vector<uint8_t> keep;         // [n_slots] slots the current call must not evict
     std::vector<int32_t> demand_slots; // slots the current call waits on
+    std::vector<uint8_t> defer;        // two-phase remap: pairs the first half left to the second
+    float miss_ema  = 0.0f;  // share of recent small-batch remaps that had a miss
+    bool  two_phase = false; // graph builds use the two-phase remap for this layer (hysteresis on miss_ema)
 
     // wave plan for multi-pass prefill (guarded by mgr->mtx): the touched experts are split into
     // plan_n_waves passes of at most plan_capacity experts each, run one pass at a time
@@ -295,6 +298,11 @@ void llama_moe_stream_remap(ggml_tensor * dst, const ggml_tensor * a, int ith, i
 // remap for THIS layer (src a) plus a lookahead prefetch for the next layer; src b holds the next
 // layer's predicted router logits. userdata is a llama_moe_stream_lookahead.
 void llama_moe_stream_remap_la(ggml_tensor * dst, const ggml_tensor * a, const ggml_tensor * b, int ith, int nth, void * userdata);
+// two-phase remap for small batches (LLAMA_MOE_STREAM_TWO_PHASE): the first half maps the resident experts and starts
+// the loads, the second half (a custom op over the router ids and an ordering token) waits and maps the rest
+void llama_moe_stream_remap2a(ggml_tensor * dst, const ggml_tensor * a, int ith, int nth, void * userdata);
+void llama_moe_stream_remap2a_la(ggml_tensor * dst, const ggml_tensor * a, const ggml_tensor * b, int ith, int nth, void * userdata);
+void llama_moe_stream_remap2b(ggml_tensor * dst, int ith, int nth, void * userdata);
 
 // callbacks of the multi-pass prefill ops, used when a ubatch touches more experts than the cache
 // holds; each src[0] is the contiguous selected ids
