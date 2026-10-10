@@ -137,6 +137,18 @@ struct llama_moe_stream_layer {
     // one-layer-ahead prefetch (LLAMA_MOE_STREAM_LOOKAHEAD), set by the model at load time
     ggml_tensor *                     la_gate_inp = nullptr; // next layer's ffn_gate_inp
     std::unique_ptr<llama_moe_stream_lookahead> la;
+
+    // same-layer hint (LLAMA_MOE_STREAM_HINT): this layer's router run on the layer input before attention, by a host
+    // op at the start of the layer. Its top experts are read while the GPU computes the attention; the remap op that
+    // decides stays the one after the real router, so a wrong hint costs reads, never results.
+    std::vector<int32_t> hint_pred;          // experts the last hint predicted for this layer
+    std::vector<uint8_t> hint_mark;          // [n_expert] 1 = in hint_pred
+    bool                 hint_valid = false; // hint_pred belongs to the call the next remap serves
+    std::vector<float>   hint_scratch;
+
+    // F32 [n_expert, hint_max_tokens] outside the graph's compute buffer: the GPU copies the hint logits here, so the
+    // async hint op reads them after the GPU has gone on and reused the graph memory (null when hints are off)
+    ggml_tensor * hint_store = nullptr;
 };
 
 // one queued slab read
@@ -190,11 +202,20 @@ struct llama_moe_stream {
     // host-visible (measured no better than reading straight into the slot)
     bool no_zerocopy = false;
 
+    // same-layer hint (LLAMA_MOE_STREAM_HINT=K): top-K experts per token row, 0 = off;
+    // LLAMA_MOE_STREAM_HINT_READ=0 only measures the prediction, 1 (default) also starts the reads
+    uint32_t hint_k    = 0;
+    bool     hint_read = true;
+    uint32_t hint_max_tokens = 16; // graphs with more tokens (prefill) get no hint
+
     bool use_direct_io = false; // F_NOCACHE / O_DIRECT reads, no page cache
 
     llama_files files; // privately reopened GGUF files, same indices as the loader's
 
     std::vector<llama_moe_stream_buffer> cache_bufs; // one per streamed layer and buffer type
+
+    ggml_context_ptr        hint_ctx; // the layers' hint_store tensors
+    ggml_backend_buffer_ptr hint_buf;
 
     size_t  max_nb_expert      = 0;
     int64_t hot_decay_interval = 0; // remap calls between route-hotness halvings (0 = no decay)
@@ -266,6 +287,15 @@ struct llama_moe_stream {
         int64_t n_spec_dispatch    = 0; // speculative reads started
         int64_t n_spec_with_demand = 0; // of those, started while demand work was pending
 
+        // same-layer hint: what it predicted against what the router then picked
+        int64_t n_hint_calls    = 0; // hint ops run
+        int64_t n_hint_issued   = 0; // expert loads the hints started
+        int64_t n_hint_touched  = 0; // experts the router picked on a hinted call
+        int64_t n_hint_covered  = 0; // of those, predicted by the hint
+        int64_t n_hint_miss     = 0; // misses (not resident, not loading) on a hinted call ...
+        int64_t n_hint_miss_cov = 0; // ... the hint had predicted (a read it could have started early)
+        int64_t n_hint_late     = 0; // router picks still loading from a hint when the remap ran
+
         int64_t n_read_bucket[MOE_STREAM_READ_BUCKETS] = {0};
     };
 
@@ -294,6 +324,10 @@ struct llama_moe_stream {
 
 // callback of the remap op inserted by build_moe_ffn (decode and small ubatches)
 void llama_moe_stream_remap(ggml_tensor * dst, const ggml_tensor * a, int ith, int nth, void * userdata);
+
+// same-layer hint op: src a holds this layer's router logits computed from the layer input before attention
+// [n_expert, n_tokens]; starts reads for the top experts. Writes nothing; userdata is the llama_moe_stream_layer.
+void llama_moe_stream_hint(ggml_tensor * dst, const ggml_tensor * a, int ith, int nth, void * userdata);
 
 // remap for THIS layer (src a) plus a lookahead prefetch for the next layer; src b holds the next
 // layer's predicted router logits. userdata is a llama_moe_stream_lookahead.

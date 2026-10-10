@@ -196,9 +196,26 @@ llama_moe_stream::llama_moe_stream(uint32_t n_layer, uint32_t n_slots, int32_t n
             ggml_backend_metal_register_host_op((void *) llama_moe_stream_wave_ids);
             ggml_backend_metal_register_host_op((void *) llama_moe_stream_wave_mask);
             ggml_backend_metal_register_host_op((void *) llama_moe_stream_wave_pairs);
+            // the hint only starts reads: the GPU need not wait for it (LLAMA_MOE_STREAM_HINT_SYNC=1 makes it wait)
+            const char * hs = std::getenv("LLAMA_MOE_STREAM_HINT_SYNC");
+            if (hs && atoi(hs) != 0) {
+                ggml_backend_metal_register_host_op((void *) llama_moe_stream_hint);
+            } else {
+                ggml_backend_metal_register_host_op_async((void *) llama_moe_stream_hint);
+            }
         }
     }
 #endif
+
+    if (const char * s = std::getenv("LLAMA_MOE_STREAM_HINT")) {
+        hint_k = (uint32_t) std::max(0, atoi(s));
+    }
+    if (const char * s = std::getenv("LLAMA_MOE_STREAM_HINT_READ")) {
+        hint_read = atoi(s) != 0;
+    }
+    if (const char * s = std::getenv("LLAMA_MOE_STREAM_HINT_TOKENS")) {
+        hint_max_tokens = (uint32_t) std::max(1, atoi(s));
+    }
 
     // keep every reader busy a few slabs deep, but no deeper
     q_spec_max = (size_t) this->n_io_threads * 8;
@@ -316,6 +333,49 @@ void llama_moe_stream::alloc_bufs(bool no_alloc) {
 
     LLAMA_LOG_INFO("%s: expert cache size = %8.2f MiB (%u slots per layer, %zu layer buffers)\n",
             __func__, size_bufs() / 1024.0 / 1024.0, n_slots, cache_bufs.size());
+
+    // hint logits store: one small host-visible tensor per streamed layer, in the first cache buffer's type
+    if (hint_k > 0 && !no_alloc && !cache_bufs.empty()) {
+        ggml_backend_buffer_type_t buft = cache_bufs.front().buft;
+        size_t n_layers = 0;
+        for (const auto & sl : layers) {
+            n_layers += sl != nullptr;
+        }
+        ggml_init_params params = {
+            /*.mem_size   =*/ ggml_tensor_overhead()*(n_layers + 1),
+            /*.mem_buffer =*/ NULL,
+            /*.no_alloc   =*/ true,
+        };
+        ggml_context * ctx = ggml_init(params);
+        if (ctx == nullptr) {
+            throw std::runtime_error("failed to create ggml context for the MoE streaming hints");
+        }
+        hint_ctx.reset(ctx);
+        for (auto & sl : layers) {
+            if (sl) {
+                sl->hint_store = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, sl->n_expert, hint_max_tokens);
+                ggml_format_name(sl->hint_store, "moe_hint_store-%d", sl->il);
+            }
+        }
+        ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors_from_buft(ctx, buft);
+        if (buf == nullptr || ggml_backend_tensor_get_host_ptr(ggml_get_first_tensor(ctx)) == nullptr) {
+            LLAMA_LOG_WARN("%s: no host-visible buffer for the MoE streaming hints, hints disabled\n", __func__);
+            if (buf) {
+                ggml_backend_buffer_free(buf);
+            }
+            for (auto & sl : layers) {
+                if (sl) {
+                    sl->hint_store = nullptr;
+                }
+            }
+            hint_ctx.reset();
+            hint_k = 0;
+        } else {
+            hint_buf.reset(buf);
+            LLAMA_LOG_INFO("%s: MoE streaming hints: top-%u per token, up to %u tokens, %s\n",
+                    __func__, hint_k, hint_max_tokens, hint_read ? "reads started early" : "measured only");
+        }
+    }
 }
 
 void llama_moe_stream::open_files(const std::vector<std::string> & paths) {
@@ -629,6 +689,19 @@ void llama_moe_stream::maybe_dump_stats_locked() {
                 dt > 0 ? 100.0*d_cpu/dt        : 0.0,
                 dt > 0 ? 100.0*(dt - d_op)/dt  : 0.0);
 
+        const int64_t d_hint = stats.n_hint_calls - stats_prev.n_hint_calls;
+        if (d_hint > 0) {
+            const int64_t d_ht = stats.n_hint_touched  - stats_prev.n_hint_touched;
+            const int64_t d_hc = stats.n_hint_covered  - stats_prev.n_hint_covered;
+            const int64_t d_hm = stats.n_hint_miss     - stats_prev.n_hint_miss;
+            const int64_t d_hv = stats.n_hint_miss_cov - stats_prev.n_hint_miss_cov;
+            LLAMA_LOG_WARN("%s: moe stream: hint calls %" PRId64 " issued %" PRId64 " | picks predicted %" PRId64 "/%" PRId64
+                           " (%5.1f%%) | misses predicted %" PRId64 "/%" PRId64 " | late %" PRId64 "\n",
+                    __func__, d_hint, stats.n_hint_issued - stats_prev.n_hint_issued,
+                    d_hc, d_ht, d_ht > 0 ? 100.0*d_hc/d_ht : 0.0, d_hv, d_hm,
+                    stats.n_hint_late - stats_prev.n_hint_late);
+        }
+
         const int64_t d_self_evict = stats.n_demand_self_evict - stats_prev.n_demand_self_evict;
         const int64_t d_spec = stats.n_spec_dispatch - stats_prev.n_spec_dispatch;
         if (d_spec > 0) {
@@ -690,6 +763,12 @@ void llama_moe_stream::print_stats() const {
     LLAMA_LOG_WARN("%s: moe stream: load stall = %.2f ms total (%.3f ms per remap call)\n",
             __func__, stats.t_stall_us/1000.0, stats.n_calls > 0 ? stats.t_stall_us/1000.0/stats.n_calls : 0.0);
     LLAMA_LOG_WARN("%s: moe stream: demand self-evictions = %" PRId64 "\n", __func__, stats.n_demand_self_evict);
+    if (stats.n_hint_calls > 0) {
+        LLAMA_LOG_WARN("%s: moe stream: hint calls %" PRId64 " issued %" PRId64 " | picks predicted %" PRId64 "/%" PRId64
+                       " | misses predicted %" PRId64 "/%" PRId64 " | late %" PRId64 "\n",
+                __func__, stats.n_hint_calls, stats.n_hint_issued, stats.n_hint_covered, stats.n_hint_touched,
+                stats.n_hint_miss_cov, stats.n_hint_miss, stats.n_hint_late);
+    }
     LLAMA_LOG_WARN("%s: moe stream: prefetch dispatch %" PRId64 " while-demand %" PRId64
                    " | expert read MiB %.2f\n",
             __func__, stats.n_spec_dispatch, stats.n_spec_with_demand, stats.n_bytes_read/1048576.0);
@@ -782,15 +861,25 @@ static void llama_moe_stream_remap_impl(ggml_tensor * dst, const ggml_tensor * a
     std::fill(sl->keep.begin(), sl->keep.end(), 0);
     sl->demand_slots.clear();
 
+    const bool hinted = sl->hint_valid && sl->hint_mark.size() == sl->n_expert;
+    sl->hint_valid = false;
+
     bool waited = false;
     for (const int32_t e : sl->uniq) {
         const auto it = sl->expert_slot.find(e);
+        if (hinted) {
+            mgr->stats.n_hint_touched++;
+            mgr->stats.n_hint_covered += sl->hint_mark[e];
+        }
         if (it != sl->expert_slot.end()) {
             const int32_t s = it->second;
             if (sl->slot_state[s] == LLAMA_MOE_STREAM_SLOT_LOADING) {
                 mgr->promote_slot_locked(*sl, s);
                 waited = true;
                 mgr->stats.n_hit_loading++;
+                if (hinted && sl->hint_mark[e]) {
+                    mgr->stats.n_hint_late++;
+                }
             } else {
                 mgr->stats.n_hit_ready++;
             }
@@ -822,6 +911,10 @@ static void llama_moe_stream_remap_impl(ggml_tensor * dst, const ggml_tensor * a
                 mgr->cv_work.notify_one();
             }
             mgr->stats.n_miss++;
+            if (hinted) {
+                mgr->stats.n_hint_miss++;
+                mgr->stats.n_hint_miss_cov += sl->hint_mark[e];
+            }
             waited = true;
             sl->keep[v] = 1;
             sl->demand_slots.push_back(v);
@@ -973,6 +1066,88 @@ static void llama_moe_stream_prefetch_next(llama_moe_stream_lookahead * la, cons
             mgr->cv_work.notify_one();
         }
         mgr->stats.n_preload_issued++;
+    }
+}
+
+// same-layer hint: the top experts of this layer's router run on the layer input before attention. Their reads start
+// here and overlap the attention; the remap after the real router decides as always, so a wrong guess costs a read and
+// possibly an eviction, never a different result.
+void llama_moe_stream_hint(ggml_tensor * dst, const ggml_tensor * a, int ith, int nth, void * userdata) {
+    GGML_UNUSED(nth);
+    GGML_UNUSED(dst);
+    if (ith != 0) {
+        return;
+    }
+
+    auto * sl  = (llama_moe_stream_layer *) userdata;
+    auto * mgr = sl->mgr;
+
+    GGML_ASSERT(a->type == GGML_TYPE_F32 && ggml_is_contiguous(a));
+    const uint32_t n_exp  = (uint32_t) a->ne[0];
+    const int64_t  n_rows = ggml_nrows(a);
+    const float  * logits = (const float *) a->data;
+
+    std::unique_lock<std::mutex> lk(mgr->mtx);
+    if (mgr->load_failed || n_exp != sl->n_expert || mgr->hint_k == 0) {
+        return;
+    }
+    mgr->stats.n_hint_calls++;
+    mgr->start_workers_locked();
+
+    // top-k of every token row, unioned
+    const uint32_t k = std::min(mgr->hint_k, n_exp);
+    sl->hint_mark.assign(n_exp, 0);
+    sl->hint_pred.clear();
+    sl->hint_scratch.resize(n_exp);
+    std::vector<int32_t> idx(n_exp);
+    for (int64_t t = 0; t < n_rows; t++) {
+        const float * row = logits + (size_t) t*n_exp;
+        for (uint32_t e = 0; e < n_exp; e++) {
+            idx[e] = (int32_t) e;
+            sl->hint_scratch[e] = std::isfinite(row[e]) ? row[e] : -INFINITY;
+        }
+        std::partial_sort(idx.begin(), idx.begin() + k, idx.end(), [&](int32_t x, int32_t y) {
+            return sl->hint_scratch[x] > sl->hint_scratch[y];
+        });
+        for (uint32_t i = 0; i < k; i++) {
+            const int32_t e = idx[i];
+            if (!sl->hint_mark[e]) {
+                sl->hint_mark[e] = 1;
+                sl->hint_pred.push_back(e);
+            }
+        }
+    }
+    sl->hint_valid = true;
+
+    if (!mgr->hint_read) {
+        return;
+    }
+
+    // the hinted experts already resident must not become victims of the hinted ones being loaded
+    std::fill(sl->keep.begin(), sl->keep.end(), 0);
+    for (const int32_t e : sl->hint_pred) {
+        const auto it = sl->expert_slot.find(e);
+        if (it != sl->expert_slot.end()) {
+            sl->keep[it->second] = 1;
+        }
+    }
+    for (const int32_t e : sl->hint_pred) {
+        if (sl->expert_slot.find(e) != sl->expert_slot.end()) {
+            continue; // resident or loading - the common case
+        }
+        const int32_t v = mgr->pick_victim_locked(*sl, sl->keep.data());
+        if (v < 0) {
+            break;
+        }
+        mgr->reserve_slot_locked(*sl, e, v);
+        sl->keep[v] = 1;
+        sl->slot_pending[v] = (uint8_t) sl->weights.size();
+        // ahead of the lookahead's guesses: this one is a layer closer and needed within the attention's time
+        for (size_t wi = sl->weights.size(); wi-- > 0;) {
+            mgr->q_spec.push_front({ sl, e, v, (int32_t) wi, sl->slot_gen[v], false });
+        }
+        mgr->cv_work.notify_all();
+        mgr->stats.n_hint_issued++;
     }
 }
 

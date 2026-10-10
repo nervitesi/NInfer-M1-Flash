@@ -2,6 +2,7 @@
 #include "llama-impl.h"
 #include "llama-memory-hybrid-idx.h"
 #include "llama-memory-recurrent.h"
+#include "llama-moe-stream.h"
 
 #include <algorithm>
 #include <cinttypes>
@@ -545,6 +546,29 @@ llama_model_qwen4exp::graph::graph(const llama_model & model, const llm_graph_pa
 
         if (hparams.is_ple(il)) {
             res_hc = build_ple(inp->get_recr(), ple_emb, res_hc, il);
+        }
+
+        // MoE streaming hint (LLAMA_MOE_STREAM_HINT): this layer's router run on the layer input, before the attention,
+        // through the FFN's own mixer. A host op starts the SSD reads of its top experts, which then overlap the
+        // attention; the remap after the real router still decides which experts run.
+        if (mstream && mstream->hint_k > 0 && n_tokens <= (int64_t) mstream->hint_max_tokens) {
+            llama_moe_stream_layer * msl = mstream->layer(il);
+            if (msl && msl->hint_store) {
+                ggml_tensor * hx = build_hc_mix(res_hc,
+                        model.layers[il].hc_ffn_norm,
+                        model.layers[il].hc_ffn_down,
+                        model.layers[il].hc_ffn_up,
+                        model.layers[il].hc_ffn_inject,
+                        nullptr, il, model.layers[il].hc_ffn_down_inject);
+                ggml_tensor * hl = ggml_mul_mat(ctx0, model.layers[il].ffn_gate_inp, hx);
+                ggml_prec_set_acc(hl, GGML_PREC_F32);
+                cb(hl, "ffn_moe_hint_logits", il);
+                // copied out of the compute buffer: the async op reads them after the GPU has gone on
+                hl = ggml_cpy(ctx0, hl, ggml_view_2d(ctx0, msl->hint_store, hl->ne[0], hl->ne[1], msl->hint_store->nb[1], 0));
+                ggml_tensor * hop = ggml_map_custom1(ctx0, hl, llama_moe_stream_hint, 1, msl);
+                cb(hop, "ffn_moe_hint", il);
+                ggml_build_forward_expand(gf, hop);
+            }
         }
 
         ggml_tensor * inject = nullptr;

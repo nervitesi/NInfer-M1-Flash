@@ -338,6 +338,11 @@ void ggml_metal_device_event_synchronize(ggml_metal_device_t dev, ggml_metal_eve
 
 void     ggml_metal_host_op_register(void * fun);
 bool     ggml_metal_host_op_is_registered(const struct ggml_tensor * op);
+
+// async host ops (Metal 4 only, otherwise they run as plain host ops): the GPU signals v and goes on, the CPU runs the
+// op when it sees v and sends no reply. Nothing may read the op's output, and its inputs may already be overwritten.
+void     ggml_metal_host_op_register_async(void * fun);
+bool     ggml_metal_host_op_is_async(const struct ggml_tensor * op);
 uint64_t ggml_metal_device_host_op_reserve(ggml_metal_device_t dev, int n_ops); // first value of 2*n_ops
 
 // encodes the CPU round trip of host op `node` at the end of cmd_buf, commits cmd_buf and returns a new, enqueued and

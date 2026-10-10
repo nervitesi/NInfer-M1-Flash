@@ -59,6 +59,11 @@ GGML_BACKEND_API void ggml_backend_metal_capture_next_compute(ggml_backend_t bac
 // the graph. Requires shared (unified memory) buffers; the op is called with ith = 0, nth = 1.
 GGML_BACKEND_API void ggml_backend_metal_register_host_op(void * fun);
 
+// Same, but the GPU does not wait: it signals when it reaches the op and goes on, and the CPU runs the op afterwards
+// with no reply (Metal 4 submission; elsewhere it runs as a plain host op). For ops nothing reads the output of, such
+// as I/O hints; the op's inputs may already be overwritten by later nodes when it runs.
+GGML_BACKEND_API void ggml_backend_metal_register_host_op_async(void * fun);
+
 GGML_BACKEND_API ggml_backend_reg_t ggml_backend_metal_reg(void);
 
 #ifdef __cplusplus

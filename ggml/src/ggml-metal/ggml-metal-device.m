@@ -1520,8 +1520,9 @@ struct ggml_metal_host_spin {
     bool            stop;
 
     // pending ops in encode order, which is the order the GPU reaches them
-    uint64_t             val [GGML_METAL_HOST_SPIN_CAP];
-    struct ggml_tensor * snap[GGML_METAL_HOST_SPIN_CAP];
+    uint64_t             val  [GGML_METAL_HOST_SPIN_CAP];
+    struct ggml_tensor * snap [GGML_METAL_HOST_SPIN_CAP];
+    bool                 async[GGML_METAL_HOST_SPIN_CAP]; // no reply: the GPU did not wait
     int                  head;
     int                  count;
 };
@@ -1556,8 +1557,9 @@ static void * ggml_metal_host_spin_main(void * arg) {
             pthread_mutex_unlock(&hs->mtx);
             break;
         }
-        const uint64_t       v    = hs->val [hs->head];
-        struct ggml_tensor * snap = hs->snap[hs->head];
+        const uint64_t       v     = hs->val  [hs->head];
+        struct ggml_tensor * snap  = hs->snap [hs->head];
+        const bool           async = hs->async[hs->head];
         pthread_mutex_unlock(&hs->mtx);
 
         bool ready = true;
@@ -1574,7 +1576,12 @@ static void * ggml_metal_host_spin_main(void * arg) {
             }
         }
 
-        if (ready) {
+        if (ready && async) {
+            // the GPU went on (and may be past later ops already): run, never signal - a reply could lower the value
+            if (!atomic_load(&hs->dev->m4_error)) {
+                ggml_metal_host_op_run(&snap[0]);
+            }
+        } else if (ready) {
             ggml_metal_mtl4_pump(hs->dev); // the buffers after this op, in jit mode: committed while it runs
             if (ggml_metal_host_op_check_order(hs->dev, event, v, snap[0].name)) {
                 ggml_metal_host_op_run(&snap[0]);
@@ -1603,7 +1610,7 @@ static bool ggml_metal_host_spin_enabled(void) {
 }
 
 // queue the reply to host op value v; returns false when the spinning thread is not used
-static bool ggml_metal_host_spin_submit(ggml_metal_device_t dev, uint64_t v, struct ggml_tensor * snap) {
+static bool ggml_metal_host_spin_submit(ggml_metal_device_t dev, uint64_t v, struct ggml_tensor * snap, bool async) {
     if (!ggml_metal_host_spin_enabled()) {
         return false;
     }
@@ -1628,8 +1635,9 @@ static bool ggml_metal_host_spin_submit(ggml_metal_device_t dev, uint64_t v, str
         GGML_ASSERT(hs->val[last] < v && "host ops must be queued in value order");
     }
     const int tail = (hs->head + hs->count) % GGML_METAL_HOST_SPIN_CAP;
-    hs->val [tail] = v;
-    hs->snap[tail] = snap;
+    hs->val  [tail] = v;
+    hs->snap [tail] = snap;
+    hs->async[tail] = async;
     hs->count++;
     pthread_cond_signal(&hs->cond);
     pthread_mutex_unlock(&hs->mtx);
@@ -1883,6 +1891,45 @@ bool ggml_metal_host_op_is_registered(const struct ggml_tensor * op) {
     return false;
 }
 
+// async host ops: the GPU signals when it reaches the op and goes on without waiting for a reply. For ops whose output
+// nothing reads, e.g. read hints; their inputs may be overwritten by later nodes while the op runs.
+static void *     g_ggml_metal_host_ops_async[GGML_METAL_MAX_HOST_OPS];
+static atomic_int g_ggml_metal_n_host_ops_async = 0;
+
+void ggml_metal_host_op_register_async(void * fun) {
+    ggml_metal_host_op_register(fun);
+
+    [g_ggml_metal_host_ops_lock lock];
+    const int n = atomic_load(&g_ggml_metal_n_host_ops_async);
+    bool found = false;
+    for (int i = 0; i < n; ++i) {
+        found = found || g_ggml_metal_host_ops_async[i] == fun;
+    }
+    if (!found) {
+        GGML_ASSERT(n < GGML_METAL_MAX_HOST_OPS);
+        g_ggml_metal_host_ops_async[n] = fun;
+        atomic_store(&g_ggml_metal_n_host_ops_async, n + 1);
+    }
+    [g_ggml_metal_host_ops_lock unlock];
+}
+
+bool ggml_metal_host_op_is_async(const struct ggml_tensor * op) {
+    if (!ggml_metal_host_op_is_registered(op)) {
+        return false;
+    }
+
+    void * fun;
+    memcpy(&fun, op->op_params, sizeof(fun));
+
+    const int n = atomic_load(&g_ggml_metal_n_host_ops_async);
+    for (int i = 0; i < n; ++i) {
+        if (g_ggml_metal_host_ops_async[i] == fun) {
+            return true;
+        }
+    }
+    return false;
+}
+
 uint64_t ggml_metal_device_host_op_reserve(ggml_metal_device_t dev, int n_ops) {
     return atomic_fetch_add(&dev->host_value, 2*(uint64_t) n_ops) + 1;
 }
@@ -1935,7 +1982,7 @@ ggml_metal_cmd_buf_t ggml_metal_device_encode_host_op(ggml_metal_device_t dev, g
 
     // registered before the command buffer is committed, so the signal cannot be missed; the reply
     // must always be sent, the GPU is blocked on it
-    if (!ggml_metal_host_spin_submit(dev, v, snap)) {
+    if (!ggml_metal_host_spin_submit(dev, v, snap, false)) {
         [event notifyListener:dev->host_listener atValue:v block:^(id<MTLSharedEvent> e, uint64_t value) {
             GGML_UNUSED(value);
             ggml_metal_mtl4_pump(dev);
@@ -2456,8 +2503,33 @@ ggml_metal_encoder_t ggml_metal_mtl4_host_op(ggml_metal_mtl4_t m4, struct ggml_t
         }
     }
 
+    // async op: the GPU signals v and goes on, no reply. In jit mode the buffers after a host op are released by the
+    // GPU reaching it, so there it runs as a plain host op (a graph's first run, and long graphs).
+    const bool async = !m4->jit && ggml_metal_host_op_is_async(node);
+
+    if (async) {
+        if (!ggml_metal_host_spin_submit(dev, v, snap, true)) {
+            [event notifyListener:dev->host_listener atValue:v block:^(id<MTLSharedEvent> e, uint64_t value) {
+                GGML_UNUSED(e);
+                GGML_UNUSED(value);
+                if (!atomic_load(&dev->m4_error)) {
+                    ggml_metal_host_op_run(&snap[0]);
+                }
+                free(snap);
+            }];
+        }
+
+        if (ggml_metal_prof_enabled() && m4->label[0] == 0) {
+            snprintf(m4->label, sizeof(m4->label), "(before async host op) %s", node->name);
+        }
+        ggml_metal_mtl4_commit_cb(m4, v);
+        ggml_metal_mtl4_begin_cb(m4);
+
+        return m4->enc;
+    }
+
     // registered before the commit, so the signal cannot be missed; the reply must always be sent
-    if (!ggml_metal_host_spin_submit(dev, v, snap)) {
+    if (!ggml_metal_host_spin_submit(dev, v, snap, false)) {
         [event notifyListener:dev->host_listener atValue:v block:^(id<MTLSharedEvent> e, uint64_t value) {
             GGML_UNUSED(value);
             ggml_metal_mtl4_pump(dev);

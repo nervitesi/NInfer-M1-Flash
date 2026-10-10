@@ -635,6 +635,10 @@ void ggml_backend_metal_register_host_op(void * fun) {
     ggml_metal_host_op_register(fun);
 }
 
+void ggml_backend_metal_register_host_op_async(void * fun) {
+    ggml_metal_host_op_register_async(fun);
+}
+
 bool ggml_backend_is_metal(ggml_backend_t backend) {
     return backend != NULL && ggml_guid_matches(backend->guid, ggml_backend_metal_guid());
 }
