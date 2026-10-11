@@ -182,6 +182,13 @@ llama_moe_stream::llama_moe_stream(uint32_t n_layer, uint32_t n_slots, int32_t n
         stats_dump_us = std::max<int64_t>(0, std::atoll(s))*1000;
     }
 
+    if (const char * s = std::getenv("LLAMA_MOE_STREAM_TRACE")) {
+        trace = fopen(s, "w");
+        if (trace == nullptr) {
+            LLAMA_LOG_WARN("%s: cannot open the routing trace %s: %s\n", __func__, s, strerror(errno));
+        }
+    }
+
 #ifdef GGML_USE_METAL
     // on Metal the remap and wave ops run as host ops inside the command stream instead of splitting
     // the graph at every streamed layer (LLAMA_MOE_STREAM_HOST_OPS=0 keeps the CPU splits)
@@ -235,6 +242,20 @@ llama_moe_stream::~llama_moe_stream() {
     for (auto & w : workers) {
         w.join();
     }
+    if (trace) {
+        fclose(trace);
+    }
+}
+
+void llama_moe_stream::trace_locked(char kind, int32_t il, const std::vector<int32_t> & experts) {
+    if (trace == nullptr) {
+        return;
+    }
+    fprintf(trace, "%c %d %zu", kind, il, experts.size());
+    for (const int32_t e : experts) {
+        fprintf(trace, " %d", e);
+    }
+    fputc('\n', trace);
 }
 
 ggml_tensor * llama_moe_stream::create_cache_tensor(
@@ -292,6 +313,9 @@ ggml_tensor * llama_moe_stream::create_cache_tensor(
         sl->route_hotness.resize(n_expert, 0);
         sl->seen         .resize(n_expert, 0);
         sl->keep         .resize(n_slots, 0);
+        sl->slot_src     .resize(n_slots, LLAMA_MOE_STREAM_SRC_DEMAND);
+        sl->slot_used    .resize(n_slots, 1);
+        sl->evicted_at   .resize(n_expert, 0);
     }
     GGML_ASSERT(sl->n_expert == n_expert);
 
@@ -416,6 +440,32 @@ void llama_moe_stream::open_files(const std::vector<std::string> & paths) {
         LLAMA_LOG_WARN("%s: MoE expert streaming uses %s (page cache bypassed)\n",
                 __func__, MOE_STREAM_DIRECT_NAME);
     }
+
+#if defined(__APPLE__)
+    // llama_file has direct I/O only on Linux, so on macOS the reads above are always buffered. On the buffered
+    // descriptors: LLAMA_MOE_STREAM_NOCACHE=1 sets F_NOCACHE (no page-cache copy kept of what is read), and
+    // LLAMA_MOE_STREAM_NORDAHEAD=1 sets F_RDAHEAD 0 (no read-ahead past the requested slab). The reads keep going
+    // straight into the cache slots.
+    {
+        const char * nc = std::getenv("LLAMA_MOE_STREAM_NOCACHE");
+        const char * ra = std::getenv("LLAMA_MOE_STREAM_NORDAHEAD");
+        const bool nocache = nc && atoi(nc) != 0;
+        const bool nordahead = ra && atoi(ra) != 0;
+        if (!use_direct_io && (nocache || nordahead)) {
+            for (auto & f : files) {
+                const int fd = f->file_id();
+                if (nocache && fcntl(fd, F_NOCACHE, 1) == -1) {
+                    LLAMA_LOG_WARN("%s: F_NOCACHE failed: %s\n", __func__, strerror(errno));
+                }
+                if (nordahead && fcntl(fd, F_RDAHEAD, 0) == -1) {
+                    LLAMA_LOG_WARN("%s: F_RDAHEAD failed: %s\n", __func__, strerror(errno));
+                }
+            }
+            LLAMA_LOG_WARN("%s: MoE expert streaming descriptors:%s%s\n", __func__,
+                    nocache ? " F_NOCACHE" : "", nordahead ? " no read-ahead" : "");
+        }
+    }
+#endif
 
     no_zerocopy = std::getenv("LLAMA_MOE_STREAM_NO_ZEROCOPY") != nullptr;
 
@@ -594,13 +644,19 @@ int32_t llama_moe_stream::pick_victim_locked(llama_moe_stream_layer & sl, const 
 
 // bind expert -> slot and mark it LOADING: evict the prior occupant, bump slot_gen (so in-flight
 // loads for the old occupant are stale) and update the expert_slot index
-void llama_moe_stream::reserve_slot_locked(llama_moe_stream_layer & sl, int32_t expert, int32_t slot) {
+void llama_moe_stream::reserve_slot_locked(llama_moe_stream_layer & sl, int32_t expert, int32_t slot, uint8_t src) {
     if (sl.slot_expert[slot] >= 0) {
         if (debug) {
             LLAMA_LOG_DEBUG("%s: layer %d: evict expert %d from slot %d\n", __func__, sl.il, sl.slot_expert[slot], slot);
         }
+        if (!sl.slot_used[slot] && sl.slot_src[slot] != LLAMA_MOE_STREAM_SRC_DEMAND) {
+            stats.n_pf_wasted[sl.slot_src[slot]]++;
+        }
+        sl.evicted_at[sl.slot_expert[slot]] = sl.n_remap;
         sl.expert_slot.erase(sl.slot_expert[slot]);
     }
+    sl.slot_src [slot] = src;
+    sl.slot_used[slot] = 0;
 
     sl.slot_expert[slot] = expert;
     sl.slot_state[slot]  = LLAMA_MOE_STREAM_SLOT_LOADING;
@@ -700,6 +756,19 @@ void llama_moe_stream::maybe_dump_stats_locked() {
                     __func__, d_hint, stats.n_hint_issued - stats_prev.n_hint_issued,
                     d_hc, d_ht, d_ht > 0 ? 100.0*d_hc/d_ht : 0.0, d_hv, d_hm,
                     stats.n_hint_late - stats_prev.n_hint_late);
+        }
+
+        {
+            const auto d = [&](const int64_t * a, const int64_t * b, int i) { return a[i] - b[i]; };
+            LLAMA_LOG_WARN("%s: moe stream: prefetch used/wasted lookahead %" PRId64 "/%" PRId64 " hint %" PRId64 "/%" PRId64
+                           " | misses evicted recently %" PRId64 " | cancelled lookahead %" PRId64 " hint %" PRId64 "\n", __func__,
+                    d(stats.n_pf_used, stats_prev.n_pf_used, LLAMA_MOE_STREAM_SRC_LOOKAHEAD),
+                    d(stats.n_pf_wasted, stats_prev.n_pf_wasted, LLAMA_MOE_STREAM_SRC_LOOKAHEAD),
+                    d(stats.n_pf_used, stats_prev.n_pf_used, LLAMA_MOE_STREAM_SRC_HINT),
+                    d(stats.n_pf_wasted, stats_prev.n_pf_wasted, LLAMA_MOE_STREAM_SRC_HINT),
+                    stats.n_miss_recent - stats_prev.n_miss_recent,
+                    d(stats.n_pf_cancelled, stats_prev.n_pf_cancelled, LLAMA_MOE_STREAM_SRC_LOOKAHEAD),
+                    d(stats.n_pf_cancelled, stats_prev.n_pf_cancelled, LLAMA_MOE_STREAM_SRC_HINT));
         }
 
         const int64_t d_self_evict = stats.n_demand_self_evict - stats_prev.n_demand_self_evict;
@@ -842,6 +911,7 @@ static void llama_moe_stream_remap_impl(ggml_tensor * dst, const ggml_tensor * a
                    "increase --moe-stream-cache or reduce the ubatch size (-ub)",
                 sl->il, sl->uniq.size(), sl->n_slots);
     }
+    mgr->trace_locked('D', sl->il, sl->uniq);
 
     // route hotness for eviction; halved periodically so a formerly hot expert ages out
     for (const int32_t e : sl->uniq) {
@@ -863,6 +933,7 @@ static void llama_moe_stream_remap_impl(ggml_tensor * dst, const ggml_tensor * a
 
     const bool hinted = sl->hint_valid && sl->hint_mark.size() == sl->n_expert;
     sl->hint_valid = false;
+    sl->n_remap++;
 
     bool waited = false;
     for (const int32_t e : sl->uniq) {
@@ -873,6 +944,10 @@ static void llama_moe_stream_remap_impl(ggml_tensor * dst, const ggml_tensor * a
         }
         if (it != sl->expert_slot.end()) {
             const int32_t s = it->second;
+            if (!sl->slot_used[s]) {
+                sl->slot_used[s] = 1;
+                mgr->stats.n_pf_used[sl->slot_src[s]]++;
+            }
             if (sl->slot_state[s] == LLAMA_MOE_STREAM_SLOT_LOADING) {
                 mgr->promote_slot_locked(*sl, s);
                 waited = true;
@@ -902,7 +977,11 @@ static void llama_moe_stream_remap_impl(ggml_tensor * dst, const ggml_tensor * a
             if (old >= 0 && sl->touched[old]) {
                 mgr->stats.n_demand_self_evict++;
             }
+            if (sl->evicted_at[e] > 0 && sl->n_remap - sl->evicted_at[e] <= 256) {
+                mgr->stats.n_miss_recent++;
+            }
             mgr->reserve_slot_locked(*sl, e, v);
+            sl->slot_used[v] = 1; // a demand load is used by definition
             // one work item PER SLAB: the 2-3 slabs of an expert are independent reads, and issuing
             // them together is what lifts the device queue depth above 1
             sl->slot_pending[v] = (uint8_t) sl->weights.size();
@@ -933,6 +1012,49 @@ static void llama_moe_stream_remap_impl(ggml_tensor * dst, const ggml_tensor * a
             sl->two_phase = true;
         } else if (sl->two_phase && sl->miss_ema < 0.15f) {
             sl->two_phase = false;
+        }
+    }
+
+    // LLAMA_MOE_STREAM_CANCEL=1: the speculative reads of this layer (lookahead, hints) the router did not pick and no
+    // worker has started yet are dropped and their slots freed. Once the router has decided they cannot help this
+    // call, and on a busy drive they would delay the next layer's reads.
+    static const bool cancel_spec = [] {
+        const char * e = std::getenv("LLAMA_MOE_STREAM_CANCEL");
+        return e && atoi(e) != 0;
+    }();
+    if (cancel_spec && !mgr->q_spec.empty()) {
+        std::vector<int32_t> drop;
+        for (const auto & w : mgr->q_spec) {
+            if (w.sl == sl && w.gen == sl->slot_gen[w.slot] && !sl->keep[w.slot] &&
+                    sl->slot_state[w.slot] == LLAMA_MOE_STREAM_SLOT_LOADING &&
+                    std::find(drop.begin(), drop.end(), w.slot) == drop.end()) {
+                bool started = false;
+                for (const auto & r : mgr->reads_inflight) {
+                    started = started || (r.sl == sl && r.slot == w.slot && r.gen == w.gen);
+                }
+                if (!started) {
+                    drop.push_back(w.slot);
+                }
+            }
+        }
+        if (!drop.empty()) {
+            for (auto it = mgr->q_spec.begin(); it != mgr->q_spec.end();) {
+                if (it->sl == sl && it->gen == sl->slot_gen[it->slot] &&
+                        std::find(drop.begin(), drop.end(), it->slot) != drop.end()) {
+                    it = mgr->q_spec.erase(it);
+                } else {
+                    ++it;
+                }
+            }
+            for (const int32_t s : drop) {
+                mgr->stats.n_pf_cancelled[sl->slot_src[s]]++;
+                sl->expert_slot.erase(sl->slot_expert[s]);
+                sl->slot_expert [s] = -1;
+                sl->slot_state  [s] = LLAMA_MOE_STREAM_SLOT_EMPTY;
+                sl->slot_pending[s] = 0;
+                sl->slot_used   [s] = 1;
+                sl->slot_gen    [s]++;
+            }
         }
     }
 
@@ -1059,7 +1181,7 @@ static void llama_moe_stream_prefetch_next(llama_moe_stream_lookahead * la, cons
         if (v < 0) {
             break; // every slot busy; the layer's own remap will demand-load it
         }
-        mgr->reserve_slot_locked(sl, best, v);
+        mgr->reserve_slot_locked(sl, best, v, LLAMA_MOE_STREAM_SRC_LOOKAHEAD);
         sl.slot_pending[v] = (uint8_t) sl.weights.size();
         for (size_t wi = 0; wi < sl.weights.size(); wi++) {
             mgr->q_spec.push_back({ &sl, best, v, (int32_t) wi, sl.slot_gen[v], false });
@@ -1139,7 +1261,7 @@ void llama_moe_stream_hint(ggml_tensor * dst, const ggml_tensor * a, int ith, in
         if (v < 0) {
             break;
         }
-        mgr->reserve_slot_locked(*sl, e, v);
+        mgr->reserve_slot_locked(*sl, e, v, LLAMA_MOE_STREAM_SRC_HINT);
         sl->keep[v] = 1;
         sl->slot_pending[v] = (uint8_t) sl->weights.size();
         // ahead of the lookahead's guesses: this one is a layer closer and needed within the attention's time
@@ -1212,6 +1334,7 @@ void llama_moe_stream::plan_waves_locked(llama_moe_stream_layer & sl, const int3
 
     // no hotness update here: a prefill sweep touches nearly every expert and would flatten the
     // decode hotness that keeps the right experts resident afterwards
+    trace_locked('P', sl.il, sl.uniq);
 
     GGML_ASSERT(sl.plan_capacity > 0);
     sl.expert_wave.assign(sl.n_expert, 0xff);
@@ -1569,7 +1692,8 @@ void llama_moe_stream::stage_wave_locked(std::unique_lock<std::mutex> & lk, llam
                 if (!sl.seen[e]) {
                     stats.n_miss_cold++;
                 }
-                reserve_slot_locked(sl, e, v);
+                reserve_slot_locked(sl, e, v, LLAMA_MOE_STREAM_SRC_WAVE);
+                sl.slot_used[v] = 1;
                 sl.slot_pending[v] = (uint8_t) sl.weights.size();
                 for (size_t wi = 0; wi < sl.weights.size(); wi++) {
                     q_demand.push_back({ &sl, e, v, (int32_t) wi, sl.slot_gen[v], true });
@@ -1599,7 +1723,8 @@ void llama_moe_stream::stage_wave_locked(std::unique_lock<std::mutex> & lk, llam
             if (!sl.seen[e]) {
                 stats.n_miss_cold++;
             }
-            reserve_slot_locked(sl, e, v);
+            reserve_slot_locked(sl, e, v, LLAMA_MOE_STREAM_SRC_WAVE);
+            sl.slot_used[v] = 1;
             sl.keep[v] = 1;
             sl.slot_pending[v] = (uint8_t) sl.weights.size();
             for (size_t wi = 0; wi < sl.weights.size(); wi++) {

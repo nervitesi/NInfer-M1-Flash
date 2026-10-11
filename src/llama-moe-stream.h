@@ -96,6 +96,12 @@ struct llama_moe_stream_layer {
 
     std::vector<uint32_t> route_hotness; // [n_expert] decayed selection counts, for eviction
     std::vector<uint8_t>  seen;          // [n_expert] for cold-miss attribution
+
+    // prefetch accounting: who loaded each slot and whether a decode remap used it before eviction
+    std::vector<uint8_t> slot_src;    // [n_slots] llama_moe_stream_src
+    std::vector<uint8_t> slot_used;   // [n_slots]
+    std::vector<int64_t> evicted_at;  // [n_expert] n_remap at the expert's last eviction, 0 = never
+    int64_t              n_remap = 0; // decode remap calls of this layer
     int64_t use_counter = 0;
 
     // scratch for the op callbacks
@@ -149,6 +155,15 @@ struct llama_moe_stream_layer {
     // F32 [n_expert, hint_max_tokens] outside the graph's compute buffer: the GPU copies the hint logits here, so the
     // async hint op reads them after the GPU has gone on and reused the graph memory (null when hints are off)
     ggml_tensor * hint_store = nullptr;
+};
+
+// who started a slot's load
+enum llama_moe_stream_src : uint8_t {
+    LLAMA_MOE_STREAM_SRC_DEMAND    = 0,
+    LLAMA_MOE_STREAM_SRC_LOOKAHEAD = 1,
+    LLAMA_MOE_STREAM_SRC_HINT      = 2,
+    LLAMA_MOE_STREAM_SRC_WAVE      = 3,
+    LLAMA_MOE_STREAM_SRC_COUNT     = 4,
 };
 
 // one queued slab read
@@ -296,10 +311,22 @@ struct llama_moe_stream {
         int64_t n_hint_miss_cov = 0; // ... the hint had predicted (a read it could have started early)
         int64_t n_hint_late     = 0; // router picks still loading from a hint when the remap ran
 
+        // prefetched loads used by a decode remap before eviction, and evicted unused; misses on experts evicted
+        // within the last 256 remaps of their layer
+        int64_t n_pf_used  [LLAMA_MOE_STREAM_SRC_COUNT] = {0};
+        int64_t n_pf_wasted[LLAMA_MOE_STREAM_SRC_COUNT] = {0};
+        int64_t n_miss_recent = 0;
+        int64_t n_pf_cancelled[LLAMA_MOE_STREAM_SRC_COUNT] = {0}; // dropped from the queue before any read started
+
         int64_t n_read_bucket[MOE_STREAM_READ_BUCKETS] = {0};
     };
 
     llama_moe_stream_stats stats;
+
+    // LLAMA_MOE_STREAM_TRACE=<path>: one text line per routing call, for offline cache-policy simulation:
+    // "D <layer> <n> <experts...>" for a decode remap, "P <layer> <n> <experts...>" for a prefill ubatch
+    FILE * trace = nullptr;
+    void trace_locked(char kind, int32_t il, const std::vector<int32_t> & experts);
 
     // periodic delta dump (LLAMA_MOE_STREAM_STATS_MS=<ms>), at WARN so llama-server shows it
     int64_t                stats_dump_us   = 0; // interval, 0 = disabled
@@ -311,7 +338,8 @@ struct llama_moe_stream {
     void start_workers_locked();
     void worker_loop(size_t worker_id);
     int32_t pick_victim_locked(llama_moe_stream_layer & sl, const uint8_t * keep) const;
-    void reserve_slot_locked(llama_moe_stream_layer & sl, int32_t expert, int32_t slot);
+    void reserve_slot_locked(llama_moe_stream_layer & sl, int32_t expert, int32_t slot,
+                             uint8_t src = LLAMA_MOE_STREAM_SRC_DEMAND);
     void promote_slot_locked(llama_moe_stream_layer & sl, int32_t slot);
 
     // multi-pass prefill helpers (called by the wave ops, all under mtx)
