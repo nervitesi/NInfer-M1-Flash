@@ -1738,15 +1738,20 @@ static void ggml_metal_mtl4_rset_update_locked(ggml_metal_device_t dev, id<MTLRe
         return;
     }
 
-    id<MTLResidencySet> all = dev->m4_rset;
-    for (id<MTLAllocation> a in rset.allAllocations) {
-        if (add) {
-            [all addAllocation:a];
-        } else {
-            [all removeAllocation:a];
+    // allAllocations returns an autoreleased array that retains the buffers. Buffers are allocated from llama code with
+    // no autorelease pool, so without this one the array (and every buffer created after the Metal 4 queue) was never
+    // released: freeing such a buffer kept its memory (a 2 GiB draft compute buffer re-reserved at load stayed wired).
+    @autoreleasepool {
+        id<MTLResidencySet> all = dev->m4_rset;
+        for (id<MTLAllocation> a in rset.allAllocations) {
+            if (add) {
+                [all addAllocation:a];
+            } else {
+                [all removeAllocation:a];
+            }
         }
+        [all commit];
     }
-    [all commit];
 }
 
 #pragma clang diagnostic pop
@@ -3459,6 +3464,7 @@ ggml_metal_buffer_t ggml_metal_buffer_map(ggml_metal_device_t dev, void * ptr, s
 }
 
 void ggml_metal_buffer_free(ggml_metal_buffer_t buf) {
+    const size_t cur0 = buf->dev->mtl_device.currentAllocatedSize;
     @autoreleasepool {
         ggml_metal_device_rsets_rm(buf->dev, buf->rset);
 
@@ -3467,6 +3473,11 @@ void ggml_metal_buffer_free(ggml_metal_buffer_t buf) {
         }
 
         ggml_metal_buffer_rset_free(buf);
+    }
+    if (getenv("GGML_METAL_DEBUG_FREE") && buf->all_size >= (64ull << 20)) {
+        GGML_LOG_INFO("%s: freed buffer of %.2f MiB (shared %d, owned %d), Metal buffers %.2f -> %.2f GiB\n", __func__,
+                buf->all_size/1048576.0, buf->is_shared, buf->owned, cur0/1073741824.0,
+                buf->dev->mtl_device.currentAllocatedSize/1073741824.0);
     }
 
     if (buf->is_shared && buf->owned) {

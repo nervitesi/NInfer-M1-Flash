@@ -255,6 +255,11 @@ struct llama_moe_stream {
     size_t q_spec_max = 0;
 
     size_t demand_inflight = 0;
+    size_t spec_inflight   = 0; // speculative reads being read by a worker
+
+    // LLAMA_MOE_STREAM_SPEC_THREADS=N: at most N workers read speculative work at once, so the others are free the
+    // moment a layer blocks on a miss (0 = no cap)
+    size_t spec_threads_max = 0;
     std::vector<llama_moe_stream_work> reads_inflight; // one entry per worker, guarded by mtx
 
     std::vector<std::thread> workers;

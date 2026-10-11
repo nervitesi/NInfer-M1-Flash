@@ -226,6 +226,9 @@ llama_moe_stream::llama_moe_stream(uint32_t n_layer, uint32_t n_slots, int32_t n
 
     // keep every reader busy a few slabs deep, but no deeper
     q_spec_max = (size_t) this->n_io_threads * 8;
+    if (const char * s = std::getenv("LLAMA_MOE_STREAM_SPEC_THREADS")) {
+        spec_threads_max = (size_t) std::max(0, atoi(s));
+    }
     if (const char * s = std::getenv("LLAMA_MOE_STREAM_SPEC_MAX")) {
         q_spec_max = (size_t) std::max(0, atoi(s));
     }
@@ -515,8 +518,11 @@ void llama_moe_stream::worker_loop(size_t worker_id) {
 
     std::unique_lock<std::mutex> lk(mtx);
     while (true) {
+        const auto spec_ok = [&] {
+            return !q_spec.empty() && (spec_threads_max == 0 || spec_inflight < spec_threads_max);
+        };
         cv_work.wait(lk, [&] {
-            return shutting_down || !q_demand.empty() || !q_spec.empty();
+            return shutting_down || !q_demand.empty() || spec_ok();
         });
         if (shutting_down) {
             break;
@@ -550,9 +556,11 @@ void llama_moe_stream::worker_loop(size_t worker_id) {
         if (w.demand) {
             demand_inflight++;
         } else {
+            spec_inflight++;
             stats.n_spec_dispatch++;
             stats.n_spec_with_demand += demand_inflight > 0;
         }
+        const bool started_spec = !w.demand;
 
         lk.unlock();
 
@@ -580,10 +588,18 @@ void llama_moe_stream::worker_loop(size_t worker_id) {
 
         GGML_ASSERT(workers_active > 0);
         workers_active--;
-        // read the live flag: a speculative read can become demand while the I/O runs
+        // read the live flag: a speculative read can become demand while the I/O runs (promote_slot_locked counted
+        // it in demand_inflight then; it still holds its speculative thread budget until it lands)
         if (reads_inflight[worker_id].demand) {
             GGML_ASSERT(demand_inflight > 0);
             demand_inflight--;
+        }
+        if (started_spec) {
+            GGML_ASSERT(spec_inflight > 0);
+            spec_inflight--;
+            if (spec_threads_max > 0) {
+                cv_work.notify_one(); // a speculative budget slot is free again
+            }
         }
         reads_inflight[worker_id] = {};
 
