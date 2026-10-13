@@ -1222,17 +1222,20 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_mask(
     const int64_t n_sel = sel_idx->ne[0];
     GGML_ASSERT(n_sel == inp_kpool->n_sel);
 
-    // scatter zeros for the selected cells into an all -inf row, the extra row n_kv takes the sentinels
-    // seeding from sel_idx ties the scatter storage lifetime to this layer
-    ggml_tensor * seed = ggml_cast(ctx0, ggml_view_1d(ctx0, sel_idx, 1, 0), GGML_TYPE_F32);
+    // the selection goes into the graph first, so the mask rows below are built right before the scatter
+    ggml_build_forward_expand(gf, sel_idx);
 
-    ggml_tensor * mask_seed = kq_mask->type == GGML_TYPE_F32 ? seed : ggml_cast(ctx0, seed, kq_mask->type);
-    mask_seed = ggml_fill(ctx0, mask_seed, -INFINITY);
-    ggml_tensor * mask_all = ggml_repeat_4d(ctx0, mask_seed, 1, n_kv + 1, tc, 1);
+    // scatter zeros for the selected cells into an all -inf row, the extra row n_kv takes the sentinels
+    // one filled row repeated over the tokens (upstream #29824): a one-element seed repeated to the whole mask ran the
+    // repeat kernel once per element
+    ggml_tensor * mask_all = ggml_new_tensor_4d(ctx0, kq_mask->type, n_kv + 1, 1, 1, 1);
+    mask_all = ggml_fill(ctx0, mask_all, -INFINITY);
+    mask_all = ggml_repeat_4d(ctx0, mask_all, n_kv + 1, tc, 1, 1);
     mask_all = ggml_reshape_3d(ctx0, mask_all, 1, n_kv + 1, tc);
 
-    ggml_tensor * zero_seed = ggml_fill(ctx0, seed, 0.0f);
-    ggml_tensor * zeros = ggml_repeat_4d(ctx0, zero_seed, 1, n_sel, tc, 1);
+    ggml_tensor * zeros = ggml_new_tensor_4d(ctx0, kq_mask->type, n_sel, 1, 1, 1);
+    zeros = ggml_fill(ctx0, zeros, 0.0f);
+    zeros = ggml_repeat_4d(ctx0, zeros, n_sel, tc, 1, 1);
     zeros = ggml_reshape_3d(ctx0, zeros, 1, n_sel, tc);
 
     ggml_tensor * sel = ggml_set_rows(ctx0, mask_all, zeros, ggml_reshape_3d(ctx0, sel_idx, n_sel, tc, 1));
