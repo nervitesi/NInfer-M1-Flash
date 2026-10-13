@@ -5,6 +5,7 @@
 
 #include <string>
 #include <unordered_set>
+#include <functional>
 #include <list>
 #include <map>
 
@@ -622,6 +623,9 @@ struct server_prompt_cache {
 
     // in tokens, 0 = no limit
     size_t limit_tokens = 0;
+
+    // NInfer-M1: called with each entry the limits push out, before it is dropped (the server writes large ones to disk)
+    std::function<void(const server_prompt_cache_state &)> on_evict;
 
     size_t size() const;
 

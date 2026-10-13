@@ -1102,6 +1102,9 @@ private:
         std::error_code ec;
         fs::create_directories(dir, ec);
         for (const auto & f : fs::directory_iterator(dir, ec)) {
+            if (f.path().filename().string().rfind("spill-", 0) == 0) {
+                continue; // the conversations written during the run stay for the next one
+            }
             if (f.path().extension() == ".nipc" || f.path().extension() == ".state" || f.path().extension() == ".partial") {
                 fs::remove(f.path(), ec);
             }
@@ -1293,6 +1296,360 @@ private:
         }
     }
 
+    //
+    // NInfer-M1: second level of the prompt cache, on disk, while the server runs.
+    // A long conversation lost its state when another one took the slot: its state did not fit the RAM cache (30-60k
+    // tokens of Claude Code with 8 checkpoints is 2-4.5 GiB, against --cache-ram 2048), or two such states did not fit
+    // together and the cache dropped the older one. Going back to it read the whole prompt again: 2-7 minutes on the
+    // true Q4. Both now go to --prompt-cache-dir as spill-<n> (tokens, the last checkpoints, the sequence states) and are
+    // loaded back when a request continues them.
+    //   LLAMA_PROMPT_SPILL_MIN_TOKENS  smallest conversation worth writing (default 8192, 0 = off)
+    //   LLAMA_PROMPT_SPILL_CKPTS       checkpoints kept with it, the last ones (default 2; ~0.45 GiB each on Flash Next)
+    //   LLAMA_PROMPT_SPILL_MAX_GIB / LLAMA_PROMPT_SPILL_MAX   disk budget (default 24 GiB, 6 entries), least recently used out
+    //
+
+    static constexpr char prompt_spill_magic[8] = {'N', 'I', 'P', 'S', 'P', 'I', 'L', '1'};
+
+    struct prompt_spill {
+        std::string          base;       // <base>.nipc, <base>.tgt.state, <base>.dft.state in the prompt cache directory
+        llama_tokens         tokens;
+        std::vector<int64_t> ckpt_n_tokens;
+        size_t               bytes  = 0;
+        int64_t              t_used = 0;
+    };
+
+    std::vector<prompt_spill> prompt_spills;
+    uint64_t                  prompt_spill_next = 0;
+
+    static int64_t prompt_spill_env(const char * name, int64_t def) {
+        const char * s = getenv(name);
+        return s != nullptr ? (int64_t) atoll(s) : def;
+    }
+
+    void prompt_spill_remove(size_t i) {
+        namespace fs = std::filesystem;
+        const fs::path dir(params_base.prompt_cache_dir);
+        std::error_code ec;
+        for (const char * ext : {".nipc", ".tgt.state", ".dft.state"}) {
+            fs::remove(dir / (prompt_spills[i].base + ext), ec);
+        }
+        prompt_spills.erase(prompt_spills.begin() + i);
+    }
+
+    // the prefix of `tokens` that an entry can restore: all of it if it is a prefix, else up to its last checkpoint
+    static int64_t prompt_spill_usable(const prompt_spill & sp, const llama_tokens & tokens) {
+        const size_t n = std::min(sp.tokens.size(), tokens.size());
+        size_t lcp = 0;
+        while (lcp < n && sp.tokens[lcp] == tokens[lcp]) {
+            lcp++;
+        }
+        if (lcp == sp.tokens.size()) {
+            return (int64_t) lcp;
+        }
+        int64_t best = 0;
+        for (const int64_t c : sp.ckpt_n_tokens) {
+            if (c <= (int64_t) lcp) {
+                best = std::max(best, c);
+            }
+        }
+        return best;
+    }
+
+    // a state blob of the RAM cache behind the header of llama_state_seq_save_file, so it loads like a slot's state file.
+    // llama_state_seq_get_data_ext puts the io magic (0xaf143cd8, llama-context.cpp) and the source seq_id before the
+    // state, the file format has neither: they are left out.
+    static bool prompt_spill_write_blob(const std::filesystem::path & p, const llama_tokens & tokens, const std::vector<uint8_t> & blob) {
+        constexpr uint32_t io_magic = 0xaf143cd8;
+        constexpr size_t   prefix   = sizeof(uint32_t) + sizeof(llama_seq_id);
+        uint32_t magic = 0;
+        if (blob.size() < prefix || (memcpy(&magic, blob.data(), sizeof(magic)), magic != io_magic)) {
+            return false;
+        }
+        std::ofstream out(p, std::ios::binary);
+        const uint32_t hdr[3] = { LLAMA_STATE_SEQ_MAGIC, LLAMA_STATE_SEQ_VERSION, (uint32_t) tokens.size() };
+        out.write((const char *) hdr, sizeof(hdr));
+        out.write((const char *) tokens.data(), tokens.size()*sizeof(llama_token));
+        out.write((const char *) blob.data() + prefix, blob.size() - prefix);
+        out.close();
+        return (bool) out;
+    }
+
+    // write a conversation to disk, from the slot (its sequence states, streamed) or from an entry the RAM cache drops
+    // (its state blobs); `slot` or `data` is null
+    void prompt_spill_write(const server_tokens & prompt_tokens, const std::list<common_prompt_checkpoint> & checkpoints,
+                            const server_slot * slot, const server_prompt_data * data) {
+        namespace fs = std::filesystem;
+        static const int64_t min_tokens = prompt_spill_env("LLAMA_PROMPT_SPILL_MIN_TOKENS", 8192);
+        static const int64_t n_keep     = prompt_spill_env("LLAMA_PROMPT_SPILL_CKPTS", 2);
+        static const int64_t max_bytes  = prompt_spill_env("LLAMA_PROMPT_SPILL_MAX_GIB", 24) << 30;
+        static const int64_t max_n      = prompt_spill_env("LLAMA_PROMPT_SPILL_MAX", 6);
+        if (params_base.prompt_cache_dir.empty() || min_tokens <= 0 || (int64_t) prompt_tokens.size() < min_tokens) {
+            return;
+        }
+        llama_tokens tokens;
+        try {
+            tokens = prompt_tokens.get_tokens();
+        } catch (...) {
+            return; // multimodal prompts are not written
+        }
+        const char * from = slot ? "slot" : "RAM cache";
+        const int64_t t_start = ggml_time_us();
+        const fs::path dir(params_base.prompt_cache_dir);
+        std::error_code ec;
+        fs::create_directories(dir, ec);
+
+        // an earlier state of the same conversation (a prefix of this one) is superseded; this one already on disk is kept
+        for (size_t i = 0; i < prompt_spills.size();) {
+            const auto & sp = prompt_spills[i];
+            if (sp.tokens == tokens) {
+                prompt_spills[i].t_used = ggml_time_us();
+                return;
+            }
+            if (sp.tokens.size() < tokens.size() && std::equal(sp.tokens.begin(), sp.tokens.end(), tokens.begin())) {
+                prompt_spill_remove(i);
+            } else {
+                ++i;
+            }
+        }
+
+        prompt_spill sp;
+        sp.base   = "spill-" + std::to_string(prompt_spill_next++);
+        sp.tokens = tokens;
+        const fs::path meta = dir / (sp.base + ".nipc");
+        const fs::path tgt  = dir / (sp.base + ".tgt.state");
+        const fs::path dft  = dir / (sp.base + ".dft.state");
+        const fs::path tgt_tmp(tgt.string() + ".partial");
+        const fs::path dft_tmp(dft.string() + ".partial");
+        const fs::path meta_tmp(meta.string() + ".partial");
+        auto fail = [&](const char * what) {
+            SRV_WRN("prompt cache: failed to write %s of a conversation (%s) to disk\n", what, from);
+            for (const auto & p : {meta, tgt, dft, meta_tmp, tgt_tmp, dft_tmp}) {
+                fs::remove(p, ec);
+            }
+        };
+
+        // states first, through .partial names, so a missing or truncated file never pairs with a header
+        const bool has_dft = ctx_dft != nullptr;
+        if (slot) {
+            if (llama_state_seq_save_file(ctx_tgt, tgt_tmp.string().c_str(), slot->id, tokens.data(), tokens.size()) == 0) {
+                return fail("the state");
+            }
+            if (has_dft && llama_state_seq_save_file(ctx_dft, dft_tmp.string().c_str(), slot->id, tokens.data(), tokens.size()) == 0) {
+                return fail("the draft state");
+            }
+        } else {
+            if (!prompt_spill_write_blob(tgt_tmp, tokens, data->main)) {
+                return fail("the state");
+            }
+            if (has_dft && (data->drft.empty() || !prompt_spill_write_blob(dft_tmp, tokens, data->drft))) {
+                return fail("the draft state");
+            }
+        }
+        fs::rename(tgt_tmp, tgt, ec);
+        if (has_dft) {
+            fs::rename(dft_tmp, dft, ec);
+        }
+
+        // only the last checkpoints: a request that continues the conversation diverges near its end
+        const size_t n_ckpt = std::min(checkpoints.size(), (size_t) std::max<int64_t>(0, n_keep));
+        std::ofstream out(meta_tmp, std::ios::binary);
+        auto put_u64 = [&](uint64_t v) { out.write((const char *) &v, sizeof(v)); };
+        auto put_buf = [&](const void * p, size_t n) { put_u64(n); out.write((const char *) p, n); };
+        const std::string fp = prompt_cache_fingerprint();
+        out.write(prompt_spill_magic, sizeof(prompt_spill_magic));
+        put_buf(fp.data(), fp.size());
+        put_u64((uint64_t) has_dft);
+        put_buf(tokens.data(), tokens.size()*sizeof(llama_token));
+        put_u64(n_ckpt);
+        size_t skip = checkpoints.size() - n_ckpt;
+        for (const auto & c : checkpoints) {
+            if (skip > 0) {
+                skip--;
+                continue;
+            }
+            const int64_t hdr[4] = { c.n_tokens, c.id_task, c.pos_min, c.pos_max };
+            out.write((const char *) hdr, sizeof(hdr));
+            put_buf(c.data_tgt.data(),  c.data_tgt.size());
+            put_buf(c.data_dft.data(),  c.data_dft.size());
+            put_buf(c.data_spec.data(), c.data_spec.size());
+            sp.ckpt_n_tokens.push_back(c.n_tokens);
+        }
+        out.close();
+        if (!out) {
+            return fail("the header");
+        }
+        fs::rename(meta_tmp, meta, ec);
+        sp.bytes  = fs::file_size(meta, ec) + fs::file_size(tgt, ec) + (has_dft ? fs::file_size(dft, ec) : 0);
+        sp.t_used = ggml_time_us();
+        SRV_INF("prompt cache: wrote a conversation that left the %s to disk as %s (%zu tokens, %zu checkpoints, %.1f MiB) in %.2f s\n",
+                from, sp.base.c_str(), tokens.size(), n_ckpt, sp.bytes/1024.0/1024.0, (ggml_time_us() - t_start)/1e6);
+        prompt_spills.push_back(std::move(sp));
+
+        // disk budget: least recently used out
+        auto total = [&]() { size_t s = 0; for (const auto & e : prompt_spills) { s += e.bytes; } return s; };
+        while (prompt_spills.size() > 1 && ((int64_t) prompt_spills.size() > max_n || (int64_t) total() > max_bytes)) {
+            size_t lru = 0;
+            for (size_t i = 1; i < prompt_spills.size(); ++i) {
+                if (prompt_spills[i].t_used < prompt_spills[lru].t_used) {
+                    lru = i;
+                }
+            }
+            SRV_INF("prompt cache: disk budget, removing %s (%zu tokens)\n", prompt_spills[lru].base.c_str(), prompt_spills[lru].tokens.size());
+            prompt_spill_remove(lru);
+        }
+    }
+
+    // the slot's conversation, when the RAM cache did not take it (called before the slot is reused)
+    void prompt_spill_save(server_slot & slot) {
+        if (prompt_cache) {
+            for (const auto & st : prompt_cache->states) {
+                if (st.prompt.tokens.get_common_prefix(slot.prompt.tokens) == slot.prompt.tokens.size()) {
+                    return; // the RAM cache holds it
+                }
+            }
+        }
+        prompt_spill_write(slot.prompt.tokens, slot.prompt.checkpoints, &slot, nullptr);
+    }
+
+    // load the conversation a request continues from disk, if an entry restores clearly more of it than the slot holds
+    void prompt_spill_load(server_slot & slot, const server_tokens & task_tokens) {
+        namespace fs = std::filesystem;
+        if (prompt_spills.empty()) {
+            return;
+        }
+        llama_tokens tokens;
+        try {
+            tokens = task_tokens.get_tokens();
+        } catch (...) {
+            return;
+        }
+        const int64_t have = slot.prompt.tokens.get_common_prefix(task_tokens);
+        size_t  best   = 0;
+        int64_t usable = 0;
+        for (size_t i = 0; i < prompt_spills.size(); ++i) {
+            const int64_t u = prompt_spill_usable(prompt_spills[i], tokens);
+            if (u > usable) {
+                usable = u;
+                best   = i;
+            }
+        }
+        if (usable < 4096 || usable < have + 1024) {
+            return;
+        }
+        const int64_t t_start = ggml_time_us();
+        const prompt_spill sp = prompt_spills[best];
+        const fs::path dir(params_base.prompt_cache_dir);
+
+        std::ifstream in(dir / (sp.base + ".nipc"), std::ios::binary);
+        char magic[8] = {};
+        in.read(magic, sizeof(magic));
+        auto get_u64 = [&]() { uint64_t v = 0; in.read((char *) &v, sizeof(v)); return v; };
+        auto get_buf = [&](std::vector<uint8_t> & v) { v.resize(get_u64()); in.read((char *) v.data(), v.size()); };
+        std::vector<uint8_t> buf;
+        get_buf(buf); // fingerprint, checked when the entry was indexed
+        get_u64();    // has_dft
+        get_buf(buf); // tokens, kept in the index
+        std::list<common_prompt_checkpoint> checkpoints;
+        const uint64_t n_ckpt = get_u64();
+        for (uint64_t i = 0; i < n_ckpt && in; ++i) {
+            int64_t hdr[4];
+            in.read((char *) hdr, sizeof(hdr));
+            common_prompt_checkpoint c;
+            c.n_tokens = hdr[0];
+            c.id_task  = (int) hdr[1];
+            c.pos_min  = (llama_pos) hdr[2];
+            c.pos_max  = (llama_pos) hdr[3];
+            get_buf(c.data_tgt);
+            get_buf(c.data_dft);
+            get_buf(c.data_spec);
+            checkpoints.push_back(std::move(c));
+        }
+        bool ok = in && memcmp(magic, prompt_spill_magic, sizeof(magic)) == 0;
+
+        slot.prompt_clear();
+        auto load = [&](llama_context * ctx, const fs::path & p) {
+            llama_tokens got(sp.tokens.size());
+            size_t n_got = 0;
+            const size_t res = llama_state_seq_load_file(ctx, p.string().c_str(), slot.id, got.data(), got.size(), &n_got);
+            return res != 0 && n_got == sp.tokens.size() && got == sp.tokens;
+        };
+        ok = ok && load(ctx_tgt, dir / (sp.base + ".tgt.state"));
+        if (ok && ctx_dft) {
+            ok = load(ctx_dft, dir / (sp.base + ".dft.state"));
+        }
+        // the conversation is in the slot now; it goes back to disk when the slot is taken again
+        prompt_spill_remove(best);
+        if (!ok) {
+            SRV_WRN("prompt cache: failed to load %s from disk, reading the prompt again\n", sp.base.c_str());
+            slot.prompt_clear();
+            return;
+        }
+        slot.prompt.tokens      = server_tokens(sp.tokens, false);
+        slot.prompt.checkpoints = std::move(checkpoints);
+        SRV_INF("prompt cache: loaded %s from disk into slot %d (%zu tokens, %zu checkpoints, %" PRId64 " usable for this request) in %.2f s\n",
+                sp.base.c_str(), slot.id, sp.tokens.size(), slot.prompt.checkpoints.size(), usable, (ggml_time_us() - t_start)/1e6);
+    }
+
+    // entries written by an earlier run of the server; the others (other models or settings) are deleted
+    void prompt_spill_index(const std::filesystem::path & dir, const std::string & fp) {
+        namespace fs = std::filesystem;
+        std::error_code ec;
+        std::vector<fs::path> stale;
+        for (const auto & f : fs::directory_iterator(dir, ec)) {
+            const fs::path path = f.path();
+            const std::string name = path.filename().string();
+            if (path.extension() != ".nipc" || name.rfind("spill-", 0) != 0) {
+                continue;
+            }
+            prompt_spill sp;
+            sp.base = name.substr(0, name.size() - 5);
+            std::ifstream in(path, std::ios::binary);
+            char magic[8] = {};
+            in.read(magic, sizeof(magic));
+            auto get_u64 = [&]() { uint64_t v = 0; in.read((char *) &v, sizeof(v)); return v; };
+            std::vector<uint8_t> buf;
+            buf.resize(get_u64());
+            in.read((char *) buf.data(), buf.size());
+            const bool has_dft = get_u64() != 0;
+            const bool same = in && memcmp(magic, prompt_spill_magic, sizeof(magic)) == 0 && std::string(buf.begin(), buf.end()) == fp &&
+                              has_dft == (ctx_dft != nullptr);
+            if (same) {
+                sp.tokens.resize(get_u64()/sizeof(llama_token));
+                in.read((char *) sp.tokens.data(), sp.tokens.size()*sizeof(llama_token));
+                const uint64_t n_ckpt = get_u64();
+                for (uint64_t i = 0; i < n_ckpt && in; ++i) {
+                    int64_t hdr[4];
+                    in.read((char *) hdr, sizeof(hdr));
+                    sp.ckpt_n_tokens.push_back(hdr[0]);
+                    for (int b = 0; b < 3; ++b) {
+                        in.seekg((std::streamoff) get_u64(), std::ios::cur);
+                    }
+                }
+            }
+            const fs::path tgt = dir / (sp.base + ".tgt.state");
+            const fs::path dft = dir / (sp.base + ".dft.state");
+            if (!same || !in || sp.tokens.empty() || !fs::exists(tgt, ec) || (ctx_dft && !fs::exists(dft, ec))) {
+                stale.push_back(path);
+                continue;
+            }
+            sp.bytes  = fs::file_size(path, ec) + fs::file_size(tgt, ec) + (ctx_dft ? fs::file_size(dft, ec) : 0);
+            sp.t_used = (int64_t) std::chrono::duration_cast<std::chrono::microseconds>(
+                    fs::last_write_time(path, ec).time_since_epoch()).count();
+            const uint64_t n = std::strtoull(sp.base.c_str() + 6, nullptr, 10);
+            prompt_spill_next = std::max(prompt_spill_next, n + 1);
+            prompt_spills.push_back(std::move(sp));
+        }
+        for (const auto & p : stale) {
+            const std::string base = p.filename().string().substr(0, p.filename().string().size() - 5);
+            for (const char * ext : {".nipc", ".tgt.state", ".dft.state"}) {
+                fs::remove(dir / (base + ext), ec);
+            }
+        }
+        if (!prompt_spills.empty() || !stale.empty()) {
+            SRV_INF("prompt cache: %zu conversations on disk from an earlier run, %zu stale removed\n", prompt_spills.size(), stale.size());
+        }
+    }
+
     void restore_prompt_cache() {
         namespace fs = std::filesystem;
         const fs::path dir(params_base.prompt_cache_dir);
@@ -1303,7 +1660,8 @@ private:
         const int64_t t_start = ggml_time_us();
         std::vector<fs::path> files;
         for (const auto & f : fs::directory_iterator(dir, ec)) {
-            if (f.path().extension() == ".nipc" && f.path().filename().string().rfind("slot-", 0) != 0) {
+            const std::string name = f.path().filename().string();
+            if (f.path().extension() == ".nipc" && name.rfind("slot-", 0) != 0 && name.rfind("spill-", 0) != 0) {
                 files.push_back(f.path());
             }
         }
@@ -1365,6 +1723,7 @@ private:
                 n_bytes/1024.0/1024.0, dir.string().c_str(), (ggml_time_us() - t_start)/1e6);
 
         restore_slots_direct(dir, fp);
+        prompt_spill_index(dir, fp);
     }
 
     void destroy() {
@@ -1789,6 +2148,10 @@ private:
             SRV_TRC("%s", "use `--cache-ram 0` to disable the prompt cache\n");
 
             prompt_cache = std::make_unique<server_prompt_cache>(params_base.cache_ram_mib, n_ctx);
+            // NInfer-M1: the large entries the RAM cache drops go to disk (see prompt_spill_write)
+            prompt_cache->on_evict = [this](const server_prompt_cache_state & st) {
+                prompt_spill_write(st.prompt.tokens, st.prompt.checkpoints, nullptr, &st.data);
+            };
 
             if (!params_base.prompt_cache_dir.empty()) {
                 restore_prompt_cache();
@@ -2085,11 +2448,17 @@ private:
 
                 const int64_t t_start = ggml_time_us();
 
-                ret->prompt_save(*prompt_cache);
+                if (!ret->prompt_save(*prompt_cache)) {
+                    // NInfer-M1: too large for the RAM cache: to disk, instead of reading it again later
+                    prompt_spill_save(*ret);
+                }
 
                 if (!ret->prompt_load(*prompt_cache, task.tokens)) {
                     ret->prompt_clear();
                 }
+
+                // NInfer-M1: a conversation written to disk earlier may restore more of this request
+                prompt_spill_load(*ret, task.tokens);
 
                 prompt_cache->update();
 
