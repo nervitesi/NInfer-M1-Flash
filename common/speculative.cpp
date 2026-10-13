@@ -2564,6 +2564,17 @@ common_params common_base_params_to_speculative(const common_params & params) {
     result.n_outputs_max = params.n_parallel;
     result.n_outputs_max_per_seq = 1;
 
+    // NInfer-M1: the draft context reads the prompt in micro-batches of LLAMA_SPEC_DRAFT_UBATCH tokens (default 512,
+    // 0 keeps the target's). Its compute buffer follows n_ubatch: 2 GiB for the MTP head of Flash Next at the target's
+    // 4096, and llama_decode splits the prompt batch by itself; drafting and verification use far fewer tokens.
+    static const int32_t draft_ubatch = [] {
+        const char * s = getenv("LLAMA_SPEC_DRAFT_UBATCH");
+        return s != nullptr ? (int32_t) atoi(s) : 512;
+    }();
+    if (draft_ubatch > 0) {
+        result.n_ubatch = std::min(result.n_ubatch, draft_ubatch);
+    }
+
     // dflash/dspark decode the whole noise block in a single pass and sample every block position on the backend
     // TODO: refactor such properties to be announced by the speculative types
     //       something like `struct common_speculative_type_props common_speculative_type_get_props(...);`
