@@ -1196,10 +1196,10 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_mask(
     cb(score, "indexer_score", il);
 
     const int64_t n_top_pool = std::min<int64_t>(n_pool, hparams.indexer_top_k / kpool);
-    // LLAMA_QSA_TOPK_ARGSORT=1 selects with a full sort. Scores tie at the k-th place in about one row of ten (two blocks
-    // for the last slot, several thousand rows per prompt), and the radix select takes either of them, in the order the
-    // threads reach them: the same prompt gives other logits from one run to the next (0.1-0.7 on the tail logprobs at
-    // 30k tokens). The sort is reproducible, at ~1-2% of the speed.
+    // LLAMA_QSA_TOPK_ARGSORT=1 selects with a full sort. In a few dozen rows of a 30k-token prompt (25 of 172k rows with
+    // enough visible blocks) two blocks tie for the last slot. The radix select used to take either of them, whichever
+    // thread arrived first (it now takes the lower block): the same prompt gave other logits from one run to the next, by
+    // 0.1-0.7 on the tail logprobs at 30k tokens. The sort is reproducible too, at ~1-2% of the speed.
     static const bool topk_argsort = [] {
         const char * s = getenv("LLAMA_QSA_TOPK_ARGSORT");
         return s != nullptr && atoi(s) != 0;
