@@ -1019,13 +1019,14 @@ llama_model_qwen4exp::llm_graph_input_kpool * llama_model_qwen4exp::graph::build
 // scored on its own, so build_qsa_mask works on a chunk of query tokens and build_attn_qsa runs the attention chunk by
 // chunk: the allocator reuses the temporaries between chunks. LLAMA_QSA_CHUNK sets the chunk (default 256), 0 keeps one
 // chunk (the graph of before); a ubatch of at most one chunk, decode included, builds the same graph as without chunks.
-// Chunks of 256 tokens or more give the logprobs of one chunk bit for bit (48 tokens after 5-6k tokens of context, ubatch
-// 2048 and 4096); with 128 or 64 one position differed by 1.3 (cause not found), so smaller values are raised to 256.
+// Chunks that are a multiple of 256 tokens give the logprobs of one chunk bit for bit (chunks of 256 and 512, 48 tokens after
+// 5-6k tokens of context at ubatch 2048 and 4096, and 96 tokens after 30k); with 64, 96, 128, 160, 192 or 224 a few
+// positions differ by 1-2 on the tail logprobs (cause not found), so the size is rounded down to a multiple of 256.
 static int64_t qwen4exp_qsa_chunk() {
     static const int64_t chunk = [] {
         const char * s = getenv("LLAMA_QSA_CHUNK");
         const int64_t v = s != nullptr ? (int64_t) atoll(s) : (int64_t) 256;
-        return v > 0 ? std::max<int64_t>(v, 256) : (int64_t) 0;
+        return v > 0 ? std::max<int64_t>(256, v - v%256) : (int64_t) 0;
     }();
     return chunk;
 }
