@@ -251,6 +251,17 @@ static size_t ggml_backend_metal_buffer_type_get_alloc_size(ggml_backend_buffer_
             break;
     }
 
+    // NInfer-M1: GGML_METAL_DEBUG_ALLOC_SIZE=<MiB> logs every node whose buffer request is at least that large
+    static const size_t debug_alloc_size = [] {
+        const char * s = getenv("GGML_METAL_DEBUG_ALLOC_SIZE");
+        return s ? (size_t) atoll(s) * 1024 * 1024 : (size_t) 0;
+    }();
+    if (debug_alloc_size > 0 && res >= debug_alloc_size) {
+        GGML_LOG_INFO("%s: %8.2f MiB (tensor %.2f MiB) %s %s [%lld, %lld, %lld, %lld]\n", __func__, res/1048576.0,
+                ggml_nbytes(tensor)/1048576.0, ggml_op_name(tensor->op), tensor->name,
+                (long long) tensor->ne[0], (long long) tensor->ne[1], (long long) tensor->ne[2], (long long) tensor->ne[3]);
+    }
+
     return res;
 
     GGML_UNUSED(buft);

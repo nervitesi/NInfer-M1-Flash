@@ -200,9 +200,12 @@ public:
     kpool_access get_kpool_access(ggml_context * ctx, int32_t il, int64_t n_embd) const;
     ggml_tensor * gather_mla_rows(ggml_context * ctx, ggml_tensor * idxs, int64_t n_rows, int64_t n_embd, int32_t il) const;
     // new_pool_pos (I32 [4*n_new]): M-RoPE position of each new pool's first member, for pooled keys rotated at pooling time
+    // pool_mask may be null when pool_lo and pool_hi (F32 [1, n_tokens]) are given: each token then sees the pools
+    // [lo, hi) of the pool layout and the graph builds the mask itself, so no [n_pool, n_tokens] input is kept
     void set_input_kpool(ggml_tensor * pool_cells, ggml_tensor * pool_idxs, ggml_tensor * pool_mask, ggml_tensor * tail_idxs,
                          ggml_tensor * gather_mask, bool gather, ggml_tensor * new_pool_idxs, ggml_tensor * new_pool_rep,
-                         const llama_ubatch * ubatch, ggml_tensor * new_pool_pos = nullptr) const;
+                         const llama_ubatch * ubatch, ggml_tensor * new_pool_pos = nullptr,
+                         ggml_tensor * pool_lo = nullptr, ggml_tensor * pool_hi = nullptr) const;
 
 private:
     llama_memory_hybrid_idx * mem = nullptr;
