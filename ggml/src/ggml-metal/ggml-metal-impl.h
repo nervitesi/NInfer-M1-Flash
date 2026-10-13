@@ -123,6 +123,7 @@
 #define FC_TOPK_MOE                    1800
 #define FC_MOE_REDUCE                  1900
 #define FC_DSV4_HC                     2000
+#define FC_MUL_MV_MMA                  2300
 
 // op-specific constants
 #define OP_FLASH_ATTN_EXT_NQPSG 8
@@ -211,6 +212,7 @@ typedef struct {
     uint64_t nb2;
     uint64_t nb3;
     int32_t  dim;
+    int32_t  nc0;
 } ggml_metal_kargs_concat;
 
 typedef struct {
