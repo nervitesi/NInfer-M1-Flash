@@ -5935,6 +5935,7 @@ static void ggml_metal_op_top_k_radix(ggml_metal_op_t ctx, int idx) {
     const size_t smem_bucket = GGML_PAD(    sizeof(uint32_t), 16);
     const size_t smem_above  = GGML_PAD(    sizeof(uint32_t), 16);
     const size_t smem_out    = GGML_PAD(    sizeof(uint32_t), 16);
+    const size_t smem_cnt    = GGML_PAD(32*sizeof(uint32_t), 16); // tie count of each simdgroup (at most 32 of 32 threads)
 
     ggml_metal_encoder_set_pipeline(enc, pipeline);
     ggml_metal_encoder_set_bytes   (enc, &args, sizeof(args), 0);
@@ -5945,6 +5946,7 @@ static void ggml_metal_op_top_k_radix(ggml_metal_op_t ctx, int idx) {
     ggml_metal_encoder_set_threadgroup_memory_size(enc, smem_bucket, 1);
     ggml_metal_encoder_set_threadgroup_memory_size(enc, smem_above,  2);
     ggml_metal_encoder_set_threadgroup_memory_size(enc, smem_out,    3);
+    ggml_metal_encoder_set_threadgroup_memory_size(enc, smem_cnt,    4);
 
     ggml_metal_encoder_dispatch_threadgroups(enc, ne01, ne02, ne03, nth, 1, 1);
 }

@@ -255,9 +255,12 @@ kernel void kernel_top_k_f32_i32(
         threadgroup        uint * sh_bucket [[threadgroup(1)]],
         threadgroup        uint * sh_above  [[threadgroup(2)]],
         threadgroup atomic_uint * out_count [[threadgroup(3)]],
+        threadgroup        uint * sh_cnt    [[threadgroup(4)]],
         uint3   tgpig[[threadgroup_position_in_grid]],
         ushort3 tpitg[[thread_position_in_threadgroup]],
-        ushort3   ntg[[threads_per_threadgroup]]) {
+        ushort3   ntg[[threads_per_threadgroup]],
+        ushort  tiisg[[thread_index_in_simdgroup]],
+        ushort  sgitg[[simdgroup_index_in_threadgroup]]) {
 
     const uint ncols = args.ne00;
     const uint top_k = args.top_k;
@@ -332,12 +335,41 @@ kernel void kernel_top_k_f32_i32(
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    for (uint i = tid; i < ncols; i += ntg_x) {
+    // NInfer-M1: the elements equal to the threshold that fill the last slots are the first `desired` by ascending index,
+    // so that the result does not depend on which thread reaches them first (with atomics, two blocks tying for the last
+    // slot of a QSA row were taken in an order that changed from one run to the next). Each thread owns a contiguous
+    // slice, an exclusive scan of the tie counts of the slices gives where its ties start.
+    const uint n_above = top_k - desired;
+    const uint slice   = (ncols + ntg_x - 1)/ntg_x;
+    const uint lo      = min(ncols, tid*slice);
+    const uint hi      = min(ncols, lo + slice);
+
+    uint cnt = 0;
+    for (uint i = lo; i < hi; ++i) {
+        cnt += ggml_top_k_f2ui(src0_row[i]) == threshold ? 1u : 0u;
+    }
+
+    uint before = simd_prefix_exclusive_sum(cnt);
+    if (tiisg == 31) {
+        sh_cnt[sgitg] = before + cnt; // total of the simdgroup
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (tid == 0) {
+        uint acc = 0;
+        for (uint g = 0; g < (ntg_x + 31)/32; ++g) {
+            const uint t = sh_cnt[g];
+            sh_cnt[g] = acc;
+            acc += t;
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    uint pos = before + sh_cnt[sgitg];
+    for (uint i = lo; i < hi && pos < desired; ++i) {
         if (ggml_top_k_f2ui(src0_row[i]) == threshold) {
-            const uint pos = atomic_fetch_add_explicit(out_count, 1u, memory_order_relaxed);
-            if (pos < top_k) {
-                dst_row[pos] = (int32_t) i;
-            }
+            dst_row[n_above + pos] = (int32_t) i;
+            ++pos;
         }
     }
 }
