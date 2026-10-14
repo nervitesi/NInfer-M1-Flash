@@ -1,0 +1,30 @@
+name: Bug report, question or a number that does not reproduce
+description: Something does not work, or your speed is far from the published one
+body:
+  - type: input
+    id: machine
+    attributes:
+      label: Mac
+      description: Chip, memory, macOS version (the published numbers are from an M1 Max, 64 GB, macOS 26.6)
+      placeholder: M1 Max, 64 GB, macOS 26.6.2
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: Engine version
+      description: Output of `llama-server --version`, or the release tag
+    validations:
+      required: true
+  - type: textarea
+    id: what
+    attributes:
+      label: What happens
+      description: What you did, what you expected, what you got. For speed: the output of `scripts/ninfer-m1/bench_speed.py`.
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Launcher settings and the last lines of the log
+      render: shell

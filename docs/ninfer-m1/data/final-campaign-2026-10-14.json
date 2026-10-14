@@ -1,0 +1,1677 @@
+{
+ "date": "2026-10-14",
+ "machine": "MacBook Pro 16-inch 2021, M1 Max (10-core CPU, 32-core GPU), 64 GB, macOS 26.6.2",
+ "engines": {
+  "ninfer-q4-mtp": {
+   "label": "NInfer-M1 final, MTP drafts",
+   "group": "same-file",
+   "median_of_9_tps": 30.87,
+   "prompts": {
+    "italian": {
+     "first_request_tps": 24.32,
+     "timed_tps": [
+      32.91,
+      32.78,
+      32.77
+     ],
+     "draft_accepted_of_drafted": [
+      [
+       158,
+       205
+      ],
+      [
+       158,
+       205
+      ],
+      [
+       158,
+       205
+      ]
+     ]
+    },
+    "code": {
+     "first_request_tps": 24.22,
+     "timed_tps": [
+      28.83,
+      30.87,
+      31.61
+     ],
+     "draft_accepted_of_drafted": [
+      [
+       181,
+       192
+      ],
+      [
+       181,
+       192
+      ],
+      [
+       181,
+       192
+      ]
+     ]
+    },
+    "math": {
+     "first_request_tps": 26.08,
+     "timed_tps": [
+      28.32,
+      29.59,
+      30.44
+     ],
+     "draft_accepted_of_drafted": [
+      [
+       177,
+       194
+      ],
+      [
+       177,
+       194
+      ],
+      [
+       177,
+       194
+      ]
+     ]
+    }
+   },
+   "long_context_28k": {
+    "engine": "ninfer-q4-mtp",
+    "prompt_tokens": 28216,
+    "completion_tokens": 400,
+    "ttft_s": 128.2,
+    "decode_tps": 29.1,
+    "prompt_tps": 220.4,
+    "draft_acc": 288,
+    "draft_n": 295
+   },
+   "tasks_12": null,
+   "launch": {
+    "argv": [
+     "<ninfer-m1>/llama-server",
+     "--model",
+     "<models>/Qwen3.8-Flash-Next-std-i1-IQ4_XS/Qwen3.8-Flash-Next.i1-IQ4_XS.gguf",
+     "--host",
+     "127.0.0.1",
+     "--port",
+     "18112",
+     "--ctx-size",
+     "131072",
+     "--cache-type-k",
+     "q8_0",
+     "--cache-type-v",
+     "q8_0",
+     "--flash-attn",
+     "on",
+     "--n-predict",
+     "-1",
+     "--gpu-layers",
+     "all",
+     "--fit",
+     "off",
+     "--load-mode",
+     "dio",
+     "--lazy-mode",
+     "on",
+     "--jinja",
+     "--chat-template-file",
+     "scripts/ninfer-m1/qwen3.8-flash-next.jinja",
+     "--parallel",
+     "1",
+     "--threads",
+     "1",
+     "--threads-batch",
+     "8",
+     "--batch-size",
+     "4096",
+     "--ubatch-size",
+     "4096",
+     "--moe-stream-cache",
+     "34",
+     "--model-draft",
+     "<models>/Qwen3.8-Flash-Next-MTP-Unsloth/MTP/mtp-Qwen3.8-Flash-Next-shared-Q8_0-ATOMIC-V64K.gguf",
+     "--spec-type",
+     "draft-mtp",
+     "--spec-draft-n-max",
+     "3",
+     "--spec-draft-p-min",
+     "0.6",
+     "-ngld",
+     "999",
+     "--cache-prompt",
+     "--cache-ram",
+     "2048",
+     "--ctx-checkpoints",
+     "8",
+     "--prompt-cache-dir",
+     "<prompt-cache-dir>",
+     "--reasoning-budget",
+     "0"
+    ],
+    "env": {
+     "GGML_METAL4": "1",
+     "LLAMA_MOE_STREAM_HINT": "10",
+     "LLAMA_QWEN4EXP_COMPRESS_RATIO": "4"
+    }
+   }
+  },
+  "ninfer-q4-nospec": {
+   "label": "NInfer-M1 final, no speculation",
+   "group": "same-file",
+   "median_of_9_tps": 22.76,
+   "prompts": {
+    "italian": {
+     "first_request_tps": 20.53,
+     "timed_tps": [
+      25.15,
+      25.68,
+      25.7
+     ],
+     "draft_accepted_of_drafted": [
+      [
+       null,
+       null
+      ],
+      [
+       null,
+       null
+      ],
+      [
+       null,
+       null
+      ]
+     ]
+    },
+    "code": {
+     "first_request_tps": 19.56,
+     "timed_tps": [
+      21.85,
+      22.34,
+      22.76
+     ],
+     "draft_accepted_of_drafted": [
+      [
+       null,
+       null
+      ],
+      [
+       null,
+       null
+      ],
+      [
+       null,
+       null
+      ]
+     ]
+    },
+    "math": {
+     "first_request_tps": 21.18,
+     "timed_tps": [
+      22.37,
+      22.75,
+      22.89
+     ],
+     "draft_accepted_of_drafted": [
+      [
+       null,
+       null
+      ],
+      [
+       null,
+       null
+      ],
+      [
+       null,
+       null
+      ]
+     ]
+    }
+   },
+   "long_context_28k": null,
+   "tasks_12": null,
+   "launch": {
+    "argv": [
+     "<ninfer-m1>/llama-server",
+     "--model",
+     "<models>/Qwen3.8-Flash-Next-std-i1-IQ4_XS/Qwen3.8-Flash-Next.i1-IQ4_XS.gguf",
+     "--host",
+     "127.0.0.1",
+     "--port",
+     "18102",
+     "--ctx-size",
+     "131072",
+     "--cache-type-k",
+     "q8_0",
+     "--cache-type-v",
+     "q8_0",
+     "--flash-attn",
+     "on",
+     "--n-predict",
+     "-1",
+     "--gpu-layers",
+     "all",
+     "--fit",
+     "off",
+     "--load-mode",
+     "dio",
+     "--lazy-mode",
+     "on",
+     "--jinja",
+     "--chat-template-file",
+     "scripts/ninfer-m1/qwen3.8-flash-next.jinja",
+     "--parallel",
+     "1",
+     "--threads",
+     "1",
+     "--threads-batch",
+     "8",
+     "--batch-size",
+     "4096",
+     "--ubatch-size",
+     "4096",
+     "--moe-stream-cache",
+     "34",
+     "--cache-prompt",
+     "--cache-ram",
+     "2048",
+     "--ctx-checkpoints",
+     "8",
+     "--prompt-cache-dir",
+     "<prompt-cache-dir>",
+     "--reasoning-budget",
+     "0"
+    ],
+    "env": {
+     "GGML_METAL4": "1",
+     "LLAMA_MOE_STREAM_HINT": "10",
+     "LLAMA_QWEN4EXP_COMPRESS_RATIO": "4"
+    }
+   }
+  },
+  "ninfer-q4": {
+   "label": "NInfer-M1 final, MTP + n-gram (launcher default)",
+   "group": "same-file",
+   "median_of_9_tps": 45.84,
+   "prompts": {
+    "italian": {
+     "first_request_tps": 25.5,
+     "timed_tps": [
+      31.05,
+      57.0,
+      73.53
+     ],
+     "draft_accepted_of_drafted": [
+      [
+       185,
+       281
+      ],
+      [
+       232,
+       244
+      ],
+      [
+       246,
+       246
+      ]
+     ]
+    },
+    "code": {
+     "first_request_tps": 26.52,
+     "timed_tps": [
+      45.48,
+      46.85,
+      45.78
+     ],
+     "draft_accepted_of_drafted": [
+      [
+       246,
+       246
+      ],
+      [
+       246,
+       246
+      ],
+      [
+       246,
+       246
+      ]
+     ]
+    },
+    "math": {
+     "first_request_tps": 26.21,
+     "timed_tps": [
+      45.38,
+      45.84,
+      47.24
+     ],
+     "draft_accepted_of_drafted": [
+      [
+       246,
+       246
+      ],
+      [
+       246,
+       246
+      ],
+      [
+       246,
+       246
+      ]
+     ]
+    }
+   },
+   "long_context_28k": {
+    "engine": "ninfer-q4",
+    "prompt_tokens": 28216,
+    "completion_tokens": 400,
+    "ttft_s": 127.9,
+    "decode_tps": 29.21,
+    "prompt_tps": 220.9,
+    "draft_acc": 288,
+    "draft_n": 295
+   },
+   "tasks_12": {
+    "passed": 9,
+    "total": 12,
+    "identical_to_ninfer": 12
+   },
+   "launch": {
+    "argv": [
+     "<ninfer-m1>/llama-server",
+     "--model",
+     "<models>/Qwen3.8-Flash-Next-std-i1-IQ4_XS/Qwen3.8-Flash-Next.i1-IQ4_XS.gguf",
+     "--host",
+     "127.0.0.1",
+     "--port",
+     "18101",
+     "--ctx-size",
+     "131072",
+     "--cache-type-k",
+     "q8_0",
+     "--cache-type-v",
+     "q8_0",
+     "--flash-attn",
+     "on",
+     "--n-predict",
+     "-1",
+     "--gpu-layers",
+     "all",
+     "--fit",
+     "off",
+     "--load-mode",
+     "dio",
+     "--lazy-mode",
+     "on",
+     "--jinja",
+     "--chat-template-file",
+     "scripts/ninfer-m1/qwen3.8-flash-next.jinja",
+     "--parallel",
+     "1",
+     "--threads",
+     "1",
+     "--threads-batch",
+     "8",
+     "--batch-size",
+     "4096",
+     "--ubatch-size",
+     "4096",
+     "--moe-stream-cache",
+     "34",
+     "--model-draft",
+     "<models>/Qwen3.8-Flash-Next-MTP-Unsloth/MTP/mtp-Qwen3.8-Flash-Next-shared-Q8_0-ATOMIC-V64K.gguf",
+     "--spec-type",
+     "draft-mtp,ngram-mod",
+     "--spec-ngram-mod-n-min",
+     "16",
+     "--spec-ngram-mod-n-max",
+     "32",
+     "--spec-draft-n-max",
+     "3",
+     "--spec-draft-p-min",
+     "0.6",
+     "-ngld",
+     "999",
+     "--cache-prompt",
+     "--cache-ram",
+     "2048",
+     "--ctx-checkpoints",
+     "8",
+     "--prompt-cache-dir",
+     "<prompt-cache-dir>",
+     "--reasoning-budget",
+     "0"
+    ],
+    "env": {
+     "GGML_METAL4": "1",
+     "LLAMA_MOE_STREAM_HINT": "10",
+     "LLAMA_QWEN4EXP_COMPRESS_RATIO": "4"
+    }
+   }
+  },
+  "fork1762-q4": {
+   "label": "streaming fork d1762fc, MTP",
+   "group": "same-file",
+   "median_of_9_tps": 15.96,
+   "prompts": {
+    "italian": {
+     "first_request_tps": 12.24,
+     "timed_tps": [
+      19.9,
+      19.49,
+      20.11
+     ],
+     "draft_accepted_of_drafted": [
+      [
+       167,
+       261
+      ],
+      [
+       167,
+       261
+      ],
+      [
+       167,
+       261
+      ]
+     ]
+    },
+    "code": {
+     "first_request_tps": 12.64,
+     "timed_tps": [
+      15.3,
+      15.96,
+      16.72
+     ],
+     "draft_accepted_of_drafted": [
+      [
+       183,
+       215
+      ],
+      [
+       183,
+       215
+      ],
+      [
+       183,
+       215
+      ]
+     ]
+    },
+    "math": {
+     "first_request_tps": 13.55,
+     "timed_tps": [
+      14.68,
+      15.46,
+      15.78
+     ],
+     "draft_accepted_of_drafted": [
+      [
+       180,
+       223
+      ],
+      [
+       180,
+       223
+      ],
+      [
+       180,
+       223
+      ]
+     ]
+    }
+   },
+   "long_context_28k": {
+    "engine": "fork1762-q4",
+    "prompt_tokens": 28180,
+    "completion_tokens": 400,
+    "ttft_s": 415.5,
+    "decode_tps": 13.16,
+    "prompt_tps": 67.8,
+    "draft_acc": 289,
+    "draft_n": 329
+   },
+   "tasks_12": {
+    "passed": 9,
+    "total": 12,
+    "identical_to_ninfer": 12
+   },
+   "launch": {
+    "argv": [
+     "<mihailescu2m-fork-d1762fc>/llama-server",
+     "--model",
+     "<models>/Qwen3.8-Flash-Next-std-i1-IQ4_XS/Qwen3.8-Flash-Next.i1-IQ4_XS.gguf",
+     "--host",
+     "127.0.0.1",
+     "--port",
+     "18103",
+     "--ctx-size",
+     "32768",
+     "--cache-type-k",
+     "f16",
+     "--cache-type-v",
+     "f16",
+     "--flash-attn",
+     "on",
+     "--gpu-layers",
+     "all",
+     "--fit",
+     "off",
+     "--load-mode",
+     "dio",
+     "--lazy-mode",
+     "on",
+     "--jinja",
+     "--chat-template-file",
+     "scripts/ninfer-m1/qwen3.8-flash-next.jinja",
+     "--parallel",
+     "1",
+     "--threads",
+     "8",
+     "--threads-batch",
+     "10",
+     "--poll",
+     "0",
+     "--batch-size",
+     "512",
+     "--ubatch-size",
+     "128",
+     "--moe-stream",
+     "--moe-stream-cache",
+     "34",
+     "--moe-stream-io-threads",
+     "8",
+     "--model-draft",
+     "<models>/Qwen3.8-Flash-Next-MTP-Unsloth/MTP/mtp-Qwen3.8-Flash-Next-shared-Q8_0-m1-layout.gguf",
+     "--spec-type",
+     "draft-mtp",
+     "--spec-draft-n-max",
+     "3",
+     "--spec-draft-n-min",
+     "1",
+     "--spec-draft-type-k",
+     "f16",
+     "--spec-draft-type-v",
+     "f16",
+     "--spec-draft-p-min",
+     "0",
+     "--reasoning",
+     "off"
+    ],
+    "env": {}
+   }
+  },
+  "master-q4-cpumoe": {
+   "label": "llama.cpp master, --cpu-moe",
+   "group": "same-file",
+   "median_of_9_tps": 9.74,
+   "prompts": {
+    "italian": {
+     "first_request_tps": 5.85,
+     "timed_tps": [
+      9.55,
+      9.81,
+      8.48
+     ],
+     "draft_accepted_of_drafted": [
+      [
+       null,
+       null
+      ],
+      [
+       null,
+       null
+      ],
+      [
+       null,
+       null
+      ]
+     ]
+    },
+    "code": {
+     "first_request_tps": 5.69,
+     "timed_tps": [
+      9.14,
+      9.91,
+      9.74
+     ],
+     "draft_accepted_of_drafted": [
+      [
+       null,
+       null
+      ],
+      [
+       null,
+       null
+      ],
+      [
+       null,
+       null
+      ]
+     ]
+    },
+    "math": {
+     "first_request_tps": 5.23,
+     "timed_tps": [
+      9.36,
+      9.88,
+      9.92
+     ],
+     "draft_accepted_of_drafted": [
+      [
+       null,
+       null
+      ],
+      [
+       null,
+       null
+      ],
+      [
+       null,
+       null
+      ]
+     ]
+    }
+   },
+   "long_context_28k": {
+    "engine": "master-q4-cpumoe",
+    "prompt_tokens": 28216,
+    "completion_tokens": 400,
+    "ttft_s": 1178.3,
+    "decode_tps": 4.78,
+    "prompt_tps": 24.0,
+    "draft_acc": null,
+    "draft_n": null
+   },
+   "tasks_12": {
+    "passed": 9,
+    "total": 12,
+    "identical_to_ninfer": 11
+   },
+   "launch": {
+    "argv": [
+     "<llama.cpp-master>/build/bin/llama-server",
+     "--model",
+     "<models>/Qwen3.8-Flash-Next-std-i1-IQ4_XS/Qwen3.8-Flash-Next.i1-IQ4_XS.gguf",
+     "--host",
+     "127.0.0.1",
+     "--port",
+     "18104",
+     "--ctx-size",
+     "32768",
+     "--flash-attn",
+     "on",
+     "-ngl",
+     "999",
+     "--cpu-moe",
+     "--threads",
+     "8",
+     "--jinja",
+     "--chat-template-file",
+     "scripts/ninfer-m1/qwen3.8-flash-next.jinja",
+     "--parallel",
+     "1",
+     "--reasoning-budget",
+     "0"
+    ],
+    "env": {}
+   }
+  },
+  "master-q4-moecache": {
+   "label": "llama.cpp master, --cpu-moe --moe-cache-mib 34816",
+   "group": "same-file",
+   "median_of_9_tps": 9.89,
+   "prompts": {
+    "italian": {
+     "first_request_tps": 5.88,
+     "timed_tps": [
+      9.73,
+      9.89,
+      9.91
+     ],
+     "draft_accepted_of_drafted": [
+      [
+       null,
+       null
+      ],
+      [
+       null,
+       null
+      ],
+      [
+       null,
+       null
+      ]
+     ]
+    },
+    "code": {
+     "first_request_tps": 5.48,
+     "timed_tps": [
+      8.81,
+      9.72,
+      9.93
+     ],
+     "draft_accepted_of_drafted": [
+      [
+       null,
+       null
+      ],
+      [
+       null,
+       null
+      ],
+      [
+       null,
+       null
+      ]
+     ]
+    },
+    "math": {
+     "first_request_tps": 5.43,
+     "timed_tps": [
+      9.26,
+      9.9,
+      9.92
+     ],
+     "draft_accepted_of_drafted": [
+      [
+       null,
+       null
+      ],
+      [
+       null,
+       null
+      ],
+      [
+       null,
+       null
+      ]
+     ]
+    }
+   },
+   "long_context_28k": {
+    "engine": "master-q4-moecache",
+    "prompt_tokens": 28216,
+    "completion_tokens": 400,
+    "ttft_s": 1218.5,
+    "decode_tps": 4.8,
+    "prompt_tps": 23.2,
+    "draft_acc": null,
+    "draft_n": null
+   },
+   "tasks_12": {
+    "passed": 9,
+    "total": 12,
+    "identical_to_ninfer": 11
+   },
+   "launch": {
+    "argv": [
+     "<llama.cpp-master>/build/bin/llama-server",
+     "--model",
+     "<models>/Qwen3.8-Flash-Next-std-i1-IQ4_XS/Qwen3.8-Flash-Next.i1-IQ4_XS.gguf",
+     "--host",
+     "127.0.0.1",
+     "--port",
+     "18105",
+     "--ctx-size",
+     "32768",
+     "--flash-attn",
+     "on",
+     "-ngl",
+     "999",
+     "--cpu-moe",
+     "--moe-cache-mib",
+     "34816",
+     "--threads",
+     "8",
+     "--jinja",
+     "--chat-template-file",
+     "scripts/ninfer-m1/qwen3.8-flash-next.jinja",
+     "--parallel",
+     "1",
+     "--reasoning-budget",
+     "0"
+    ],
+    "env": {}
+   }
+  },
+  "ninfer-atomic-mtp": {
+   "label": "NInfer-M1, AtomicChat 3.84 bpw variant (resident), MTP drafts",
+   "group": "fits-in-memory",
+   "median_of_9_tps": 44.08,
+   "prompts": {
+    "italian": {
+     "first_request_tps": 35.04,
+     "timed_tps": [
+      35.04,
+      35.13,
+      34.92
+     ],
+     "draft_accepted_of_drafted": [
+      [
+       145,
+       203
+      ],
+      [
+       145,
+       203
+      ],
+      [
+       145,
+       203
+      ]
+     ]
+    },
+    "code": {
+     "first_request_tps": 47.56,
+     "timed_tps": [
+      48.63,
+      48.09,
+      48.14
+     ],
+     "draft_accepted_of_drafted": [
+      [
+       185,
+       194
+      ],
+      [
+       185,
+       194
+      ],
+      [
+       185,
+       194
+      ]
+     ]
+    },
+    "math": {
+     "first_request_tps": 43.77,
+     "timed_tps": [
+      44.08,
+      44.1,
+      43.98
+     ],
+     "draft_accepted_of_drafted": [
+      [
+       175,
+       195
+      ],
+      [
+       175,
+       195
+      ],
+      [
+       175,
+       195
+      ]
+     ]
+    }
+   },
+   "long_context_28k": null,
+   "tasks_12": null,
+   "launch": {
+    "argv": [
+     "<ninfer-m1>/llama-server",
+     "--model",
+     "<models>/Qwen3.8-Flash-Next-AtomicChat/Qwen3.8-Flash-Next-AD-3.84bpw-IQ4_XS-M64-CAT.gguf",
+     "--host",
+     "127.0.0.1",
+     "--port",
+     "18113",
+     "--ctx-size",
+     "32768",
+     "--cache-type-k",
+     "q8_0",
+     "--cache-type-v",
+     "q8_0",
+     "--flash-attn",
+     "on",
+     "--gpu-layers",
+     "all",
+     "--fit",
+     "off",
+     "--load-mode",
+     "dio",
+     "--lazy-mode",
+     "on",
+     "--jinja",
+     "--chat-template-file",
+     "scripts/ninfer-m1/qwen3.8-flash-next.jinja",
+     "--parallel",
+     "1",
+     "--threads",
+     "8",
+     "--model-draft",
+     "<models>/Qwen3.8-Flash-Next-MTP-Unsloth/MTP/mtp-Qwen3.8-Flash-Next-shared-Q8_0-ATOMIC-V64K.gguf",
+     "--spec-type",
+     "draft-mtp",
+     "--spec-draft-n-max",
+     "3",
+     "--spec-draft-p-min",
+     "0.6",
+     "-ngld",
+     "999",
+     "--reasoning-budget",
+     "0"
+    ],
+    "env": {
+     "GGML_METAL4": "1"
+    }
+   }
+  },
+  "ninfer-atomic": {
+   "label": "NInfer-M1, AtomicChat 3.84 bpw variant (resident), MTP + n-gram",
+   "group": "fits-in-memory",
+   "median_of_9_tps": 140.77,
+   "prompts": {
+    "italian": {
+     "first_request_tps": 34.98,
+     "timed_tps": [
+      151.49,
+      161.3,
+      161.44
+     ],
+     "draft_accepted_of_drafted": [
+      [
+       249,
+       249
+      ],
+      [
+       249,
+       249
+      ],
+      [
+       249,
+       249
+      ]
+     ]
+    },
+    "code": {
+     "first_request_tps": 48.31,
+     "timed_tps": [
+      136.03,
+      137.81,
+      137.8
+     ],
+     "draft_accepted_of_drafted": [
+      [
+       249,
+       249
+      ],
+      [
+       249,
+       249
+      ],
+      [
+       249,
+       249
+      ]
+     ]
+    },
+    "math": {
+     "first_request_tps": 44.39,
+     "timed_tps": [
+      140.46,
+      141.26,
+      140.77
+     ],
+     "draft_accepted_of_drafted": [
+      [
+       249,
+       249
+      ],
+      [
+       249,
+       249
+      ],
+      [
+       249,
+       249
+      ]
+     ]
+    }
+   },
+   "long_context_28k": {
+    "engine": "ninfer-atomic",
+    "prompt_tokens": 28216,
+    "completion_tokens": 400,
+    "ttft_s": 106.9,
+    "decode_tps": 37.33,
+    "prompt_tps": 264.4,
+    "draft_acc": 259,
+    "draft_n": 296
+   },
+   "tasks_12": {
+    "passed": 9,
+    "total": 12,
+    "identical_to_ninfer": 3
+   },
+   "launch": {
+    "argv": [
+     "<ninfer-m1>/llama-server",
+     "--model",
+     "<models>/Qwen3.8-Flash-Next-AtomicChat/Qwen3.8-Flash-Next-AD-3.84bpw-IQ4_XS-M64-CAT.gguf",
+     "--host",
+     "127.0.0.1",
+     "--port",
+     "18106",
+     "--ctx-size",
+     "32768",
+     "--cache-type-k",
+     "q8_0",
+     "--cache-type-v",
+     "q8_0",
+     "--flash-attn",
+     "on",
+     "--gpu-layers",
+     "all",
+     "--fit",
+     "off",
+     "--load-mode",
+     "dio",
+     "--lazy-mode",
+     "on",
+     "--jinja",
+     "--chat-template-file",
+     "scripts/ninfer-m1/qwen3.8-flash-next.jinja",
+     "--parallel",
+     "1",
+     "--threads",
+     "8",
+     "--model-draft",
+     "<models>/Qwen3.8-Flash-Next-MTP-Unsloth/MTP/mtp-Qwen3.8-Flash-Next-shared-Q8_0-ATOMIC-V64K.gguf",
+     "--spec-type",
+     "draft-mtp,ngram-mod",
+     "--spec-draft-n-max",
+     "3",
+     "--spec-draft-p-min",
+     "0.6",
+     "-ngld",
+     "999",
+     "--reasoning-budget",
+     "0"
+    ],
+    "env": {
+     "GGML_METAL4": "1"
+    }
+   }
+  },
+  "mtplx-27b": {
+   "label": "MTPLX 2.11.2 (MLX), Qwen3.8 27B",
+   "group": "fits-in-memory",
+   "median_of_9_tps": 37.05,
+   "prompts": {
+    "italian": {
+     "first_request_tps": 27.65,
+     "timed_tps": [
+      26.87,
+      27.78,
+      27.84
+     ],
+     "draft_accepted_of_drafted": [
+      [
+       160,
+       287
+      ],
+      [
+       160,
+       287
+      ],
+      [
+       160,
+       287
+      ]
+     ]
+    },
+    "code": {
+     "first_request_tps": 38.22,
+     "timed_tps": [
+      38.54,
+      38.13,
+      37.05
+     ],
+     "draft_accepted_of_drafted": [
+      [
+       185,
+       213
+      ],
+      [
+       185,
+       213
+      ],
+      [
+       185,
+       213
+      ]
+     ]
+    },
+    "math": {
+     "first_request_tps": 37.73,
+     "timed_tps": [
+      37.84,
+      37.74,
+      36.97
+     ],
+     "draft_accepted_of_drafted": [
+      [
+       180,
+       207
+      ],
+      [
+       180,
+       207
+      ],
+      [
+       180,
+       207
+      ]
+     ]
+    }
+   },
+   "long_context_28k": {
+    "engine": "mtplx-27b",
+    "prompt_tokens": 28200,
+    "completion_tokens": 400,
+    "ttft_s": 208.8,
+    "decode_tps": 28.59,
+    "prompt_tps": 135.2,
+    "draft_acc": 284,
+    "draft_n": 345
+   },
+   "tasks_12": {
+    "passed": 8,
+    "total": 12,
+    "identical_to_ninfer": 6
+   },
+   "launch": {
+    "argv": [
+     "/opt/homebrew/bin/mtplx",
+     "serve",
+     "--model",
+     "~/.mtplx/models/Youssofal--Qwen3.8-27B-MTPLX-Optimized-Speed-FP16",
+     "--host",
+     "127.0.0.1",
+     "--port",
+     "18108",
+     "--no-auth",
+     "--profile",
+     "turbo",
+     "--depth",
+     "3",
+     "--generation-mode",
+     "mtp",
+     "--reasoning",
+     "off",
+     "--context-window",
+     "32768",
+     "--fan-mode",
+     "default",
+     "--yes"
+    ],
+    "env": {}
+   }
+  },
+  "mlxserve-27b": {
+   "label": "mlx-serve 26.9.6 (MLX), Qwen3.8 27B",
+   "group": "fits-in-memory",
+   "median_of_9_tps": 29.86,
+   "prompts": {
+    "italian": {
+     "first_request_tps": 23.28,
+     "timed_tps": [
+      24.06,
+      24.24,
+      24.54
+     ],
+     "draft_accepted_of_drafted": [
+      [
+       null,
+       null
+      ],
+      [
+       null,
+       null
+      ],
+      [
+       null,
+       null
+      ]
+     ]
+    },
+    "code": {
+     "first_request_tps": 29.44,
+     "timed_tps": [
+      29.13,
+      31.02,
+      32.26
+     ],
+     "draft_accepted_of_drafted": [
+      [
+       null,
+       null
+      ],
+      [
+       null,
+       null
+      ],
+      [
+       null,
+       null
+      ]
+     ]
+    },
+    "math": {
+     "first_request_tps": 29.92,
+     "timed_tps": [
+      30.03,
+      29.86,
+      31.27
+     ],
+     "draft_accepted_of_drafted": [
+      [
+       null,
+       null
+      ],
+      [
+       null,
+       null
+      ],
+      [
+       null,
+       null
+      ]
+     ]
+    }
+   },
+   "long_context_28k": {
+    "engine": "mlxserve-27b",
+    "prompt_tokens": 28180,
+    "completion_tokens": 83,
+    "ttft_s": 260.3,
+    "decode_tps": 14.97,
+    "prompt_tps": 108.3,
+    "draft_acc": null,
+    "draft_n": null
+   },
+   "tasks_12": {
+    "passed": 8,
+    "total": 12,
+    "identical_to_ninfer": 5
+   },
+   "launch": {
+    "argv": [
+     "~/.local/opt/mlx-serve-26.9.6/mlx-serve-macos-arm64/mlx-serve",
+     "--model",
+     "~/.mtplx/models/Youssofal--Qwen3.8-27B-MTPLX-Optimized-Speed-FP16",
+     "--serve",
+     "--host",
+     "127.0.0.1",
+     "--port",
+     "18109",
+     "--no-vision",
+     "--mtp",
+     "--ctx-size",
+     "32768"
+    ],
+    "env": {}
+   }
+  },
+  "master-27b": {
+   "label": "llama.cpp master, Qwen3.8 27B Q6_K, MTP",
+   "group": "fits-in-memory",
+   "median_of_9_tps": 26.82,
+   "prompts": {
+    "italian": {
+     "first_request_tps": 20.61,
+     "timed_tps": [
+      20.61,
+      20.63,
+      20.61
+     ],
+     "draft_accepted_of_drafted": [
+      [
+       157,
+       198
+      ],
+      [
+       157,
+       198
+      ],
+      [
+       157,
+       198
+      ]
+     ]
+    },
+    "code": {
+     "first_request_tps": 27.74,
+     "timed_tps": [
+      27.74,
+      27.75,
+      27.74
+     ],
+     "draft_accepted_of_drafted": [
+      [
+       185,
+       200
+      ],
+      [
+       185,
+       200
+      ],
+      [
+       185,
+       200
+      ]
+     ]
+    },
+    "math": {
+     "first_request_tps": 26.82,
+     "timed_tps": [
+      26.82,
+      26.84,
+      26.81
+     ],
+     "draft_accepted_of_drafted": [
+      [
+       183,
+       198
+      ],
+      [
+       183,
+       198
+      ],
+      [
+       183,
+       198
+      ]
+     ]
+    }
+   },
+   "long_context_28k": {
+    "engine": "master-27b",
+    "prompt_tokens": 28216,
+    "completion_tokens": 400,
+    "ttft_s": 248.2,
+    "decode_tps": 18.35,
+    "prompt_tps": 113.8,
+    "draft_acc": 261,
+    "draft_n": 299
+   },
+   "tasks_12": {
+    "passed": 9,
+    "total": 12,
+    "identical_to_ninfer": 5
+   },
+   "launch": {
+    "argv": [
+     "<llama.cpp-master>/build/bin/llama-server",
+     "--model",
+     "<models>/Qwen3.8-27B-GGUF/Qwen3.8-27B-Q6_K.gguf",
+     "--host",
+     "127.0.0.1",
+     "--port",
+     "18110",
+     "--ctx-size",
+     "32768",
+     "--flash-attn",
+     "on",
+     "-ngl",
+     "999",
+     "--jinja",
+     "--parallel",
+     "1",
+     "--reasoning-budget",
+     "0",
+     "--spec-type",
+     "draft-mtp",
+     "--spec-draft-n-max",
+     "3",
+     "--spec-draft-p-min",
+     "0.6"
+    ],
+    "env": {}
+   }
+  },
+  "ninfer-27b": {
+   "label": "NInfer-M1 final, Qwen3.8 27B Q6_K, MTP",
+   "group": "fits-in-memory",
+   "median_of_9_tps": 25.89,
+   "prompts": {
+    "italian": {
+     "first_request_tps": 20.4,
+     "timed_tps": [
+      20.35,
+      19.41,
+      19.01
+     ],
+     "draft_accepted_of_drafted": [
+      [
+       157,
+       198
+      ],
+      [
+       157,
+       198
+      ],
+      [
+       157,
+       198
+      ]
+     ]
+    },
+    "code": {
+     "first_request_tps": 25.45,
+     "timed_tps": [
+      25.89,
+      26.53,
+      26.42
+     ],
+     "draft_accepted_of_drafted": [
+      [
+       185,
+       200
+      ],
+      [
+       185,
+       200
+      ],
+      [
+       185,
+       200
+      ]
+     ]
+    },
+    "math": {
+     "first_request_tps": 25.63,
+     "timed_tps": [
+      25.77,
+      25.9,
+      26.15
+     ],
+     "draft_accepted_of_drafted": [
+      [
+       183,
+       198
+      ],
+      [
+       183,
+       198
+      ],
+      [
+       183,
+       198
+      ]
+     ]
+    }
+   },
+   "long_context_28k": {
+    "engine": "ninfer-27b",
+    "prompt_tokens": 28216,
+    "completion_tokens": 400,
+    "ttft_s": 248.5,
+    "decode_tps": 18.24,
+    "prompt_tps": 113.6,
+    "draft_acc": 261,
+    "draft_n": 299
+   },
+   "tasks_12": {
+    "passed": 9,
+    "total": 12,
+    "identical_to_ninfer": 5
+   },
+   "launch": {
+    "argv": [
+     "<ninfer-m1>/llama-server",
+     "--model",
+     "<models>/Qwen3.8-27B-GGUF/Qwen3.8-27B-Q6_K.gguf",
+     "--host",
+     "127.0.0.1",
+     "--port",
+     "18107",
+     "--ctx-size",
+     "32768",
+     "--flash-attn",
+     "on",
+     "-ngl",
+     "999",
+     "--fit",
+     "off",
+     "--jinja",
+     "--parallel",
+     "1",
+     "--reasoning-budget",
+     "0",
+     "--spec-type",
+     "draft-mtp",
+     "--spec-draft-n-max",
+     "3",
+     "--spec-draft-p-min",
+     "0.6"
+    ],
+    "env": {}
+   }
+  },
+  "master-27b-ar": {
+   "label": "llama.cpp master, Qwen3.8 27B Q6_K, no speculation",
+   "group": "fits-in-memory",
+   "median_of_9_tps": 13.08,
+   "prompts": {
+    "italian": {
+     "first_request_tps": 13.08,
+     "timed_tps": [
+      13.08,
+      13.09,
+      13.09
+     ],
+     "draft_accepted_of_drafted": [
+      [
+       null,
+       null
+      ],
+      [
+       null,
+       null
+      ],
+      [
+       null,
+       null
+      ]
+     ]
+    },
+    "code": {
+     "first_request_tps": 13.08,
+     "timed_tps": [
+      13.07,
+      13.09,
+      13.09
+     ],
+     "draft_accepted_of_drafted": [
+      [
+       null,
+       null
+      ],
+      [
+       null,
+       null
+      ],
+      [
+       null,
+       null
+      ]
+     ]
+    },
+    "math": {
+     "first_request_tps": 13.1,
+     "timed_tps": [
+      13.08,
+      13.08,
+      13.08
+     ],
+     "draft_accepted_of_drafted": [
+      [
+       null,
+       null
+      ],
+      [
+       null,
+       null
+      ],
+      [
+       null,
+       null
+      ]
+     ]
+    }
+   },
+   "long_context_28k": {
+    "engine": "master-27b-ar",
+    "prompt_tokens": 28216,
+    "completion_tokens": 400,
+    "ttft_s": 239.3,
+    "decode_tps": 11.52,
+    "prompt_tps": 118.0,
+    "draft_acc": null,
+    "draft_n": null
+   },
+   "tasks_12": {
+    "passed": 9,
+    "total": 12,
+    "identical_to_ninfer": 5
+   },
+   "launch": {
+    "argv": [
+     "<llama.cpp-master>/build/bin/llama-server",
+     "--model",
+     "<models>/Qwen3.8-27B-GGUF/Qwen3.8-27B-Q6_K.gguf",
+     "--host",
+     "127.0.0.1",
+     "--port",
+     "18111",
+     "--ctx-size",
+     "32768",
+     "--flash-attn",
+     "on",
+     "-ngl",
+     "999",
+     "--jinja",
+     "--parallel",
+     "1",
+     "--reasoning-budget",
+     "0"
+    ],
+    "env": {}
+   }
+  }
+ },
+ "notes": {
+  "mtplx_cached_long_context": {
+   "engine": "mtplx-27b",
+   "prompt_tokens": 28180,
+   "completion_tokens": 400,
+   "ttft_s": 3.6,
+   "decode_tps": 27.32,
+   "prompt_tps": 67158.4,
+   "draft_acc": 280,
+   "draft_n": 349
+  }
+ }
+}
